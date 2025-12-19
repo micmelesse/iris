@@ -25,8 +25,18 @@ Example:
 """
 
 from triton.language.core import _aggregate as aggregate
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+
+# Import Gluon - if this fails, you need to update Triton to a version with Gluon support
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError as e:
+    raise ImportError(
+        "Gluon is not available in your Triton installation. "
+        "Please update Triton to a version with Gluon support to use iris.experimental.iris_gluon. "
+        "You can install the latest Triton with: pip install --upgrade triton"
+    ) from e
+
 import triton
 import triton.language as tl
 
@@ -577,6 +587,66 @@ class IrisGluon:
             from iris.ccl.all_to_all import all_to_all as _all_to_all
 
             _all_to_all(output_tensor, input_tensor, self._iris, config=config, async_op=async_op)
+
+        def all_gather(self, output_tensor, input_tensor, config=None, async_op=False):
+            """
+            All-gather collective operation.
+
+            Each rank sends its input tensor to all ranks, and all ranks receive
+            and concatenate all input tensors along dimension 0 (rows), matching
+            torch.distributed.all_gather_into_tensor behavior.
+
+            Args:
+                output_tensor: Output tensor of shape (world_size * M, N) - will contain concatenated inputs
+                input_tensor: Input tensor of shape (M, N) - local rank's data to send
+                config: Config instance with kernel parameters (default: None).
+                        If None, uses default Config values.
+                async_op: If False, performs a barrier at the end. If True, returns immediately.
+                          Default: False.
+
+            Example:
+                >>> shmem = iris_gluon.iris()
+                >>> # Input: (M, N), Output: (world_size * M, N)
+                >>> shmem.ccl.all_gather(output_tensor, input_tensor)
+
+                >>> # Custom configuration
+                >>> from iris.ccl import Config
+                >>> config = Config(block_size_m=128, block_size_n=32)
+                >>> shmem.ccl.all_gather(output_tensor, input_tensor, config=config)
+            """
+            from iris.ccl.all_gather import all_gather as _all_gather
+
+            _all_gather(output_tensor, input_tensor, self._iris, config=config, async_op=async_op)
+
+        def reduce_scatter(self, output_tensor, input_tensor, config=None, async_op=False):
+            """
+            Reduce-scatter collective operation.
+
+            Each rank reduces its assigned tiles from all ranks' inputs and stores
+            the result only to its own output tensor. This is similar to all-reduce
+            but without broadcasting the result to all ranks.
+
+            Args:
+                output_tensor: Output tensor of shape (M, N) - will contain reduced tiles for this rank
+                input_tensor: Input tensor of shape (M, N) - local rank's partial data
+                config: Config instance with kernel parameters (default: None).
+                        If None, uses default Config values.
+                        Only supports reduce_scatter_variant="two_shot".
+                async_op: If False, performs a barrier at the end. If True, returns immediately.
+                          Default: False.
+
+            Example:
+                >>> shmem = iris_gluon.iris()
+                >>> shmem.ccl.reduce_scatter(output_tensor, input_tensor)
+
+                >>> # Custom configuration
+                >>> from iris.ccl import Config
+                >>> config = Config(reduce_scatter_variant="two_shot", all_reduce_distribution=1)
+                >>> shmem.ccl.reduce_scatter(output_tensor, input_tensor, config=config)
+            """
+            from iris.ccl.reduce_scatter import reduce_scatter as _reduce_scatter
+
+            _reduce_scatter(output_tensor, input_tensor, self._iris, config=config, async_op=async_op)
 
     def _log_with_rank(self, level, message):
         """Helper method to log with rank information injected into the record."""

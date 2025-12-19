@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
-FROM rocm/pytorch:rocm6.3.1_ubuntu22.04_py3.10_pytorch
+FROM rocm/pytorch:rocm7.1_ubuntu24.04_py3.13_pytorch_release_2.9.1
 
 # Use bash shell for RUN commands
 SHELL ["/bin/bash", "-c"]
@@ -31,15 +31,12 @@ RUN pip3 install --upgrade pip && \
 # Clone and install Triton
 WORKDIR $TRITON_PATH
 RUN git clone https://github.com/triton-lang/triton.git $TRITON_PATH
-RUN git checkout dd5823453bcc7973eabadb65f9d827c43281c434
+RUN git checkout 715f6b1d442601436bf8d462db6ff8e17aec8cfb
 RUN pip3 install -e .
 ENV PYTHONPATH=$TRITON_PATH
 
 # Install rocprofiler-systems
 WORKDIR /workspace
-RUN wget https://github.com/ROCm/rocprofiler-systems/releases/download/rocm-6.3.1/rocprofiler-systems-install.py && \
-    python3 ./rocprofiler-systems-install.py --prefix /opt/rocprofiler-systems --rocm 6.3 && \
-    rm -f rocprofiler-systems-install.py
 
 # Create entrypoint script
 RUN echo '#!/bin/bash' > /entrypoint.sh && \

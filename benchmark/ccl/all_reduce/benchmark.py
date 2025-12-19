@@ -47,16 +47,21 @@ def parse_args():
         help="Output file",
     )
     parser.add_argument("--heap_size", type=int, default=1 << 34, help="Iris heap size")
-    parser.add_argument("--comm_sms", type=int, default=32, help="Number of SMs for all-reduce kernel")
-    parser.add_argument("--block_size_m", type=int, default=None, help="Block size for M dimension tiling")
-    parser.add_argument("--block_size_n", type=int, default=None, help="Block size for N dimension tiling")
-    parser.add_argument("--swizzle_size", type=int, default=None, help="Number of tiles to swizzle together")
+    parser.add_argument("--comm_sms", type=int, default=64, help="Number of SMs for all-reduce kernel")
+    parser.add_argument(
+        "--benchmark_rccl",
+        action="store_true",
+        help="Also benchmark PyTorch RCCL (all_reduce) for comparison",
+    )
+    parser.add_argument("--block_size_m", type=int, default=64, help="Block size for M dimension tiling")
+    parser.add_argument("--block_size_n", type=int, default=64, help="Block size for N dimension tiling")
+    parser.add_argument("--swizzle_size", type=int, default=4, help="Number of tiles to swizzle together")
     parser.add_argument("--num_xcds", type=int, default=None, help="Number of XCDs (auto-detected if not set)")
     parser.add_argument("-r", "--num_ranks", type=int, default=8, help="Number of ranks/processes")
     parser.add_argument(
         "--variant",
         type=str,
-        default="atomic",
+        default="two_shot",
         choices=["atomic", "ring", "two_shot", "one_shot", "spinlock"],
         help="All-reduce variant to use",
     )
@@ -79,6 +84,9 @@ def parse_args():
         default=None,
         help="Column slice size for ring variant (power of two, must divide block_size_n)",
     )
+    parser.add_argument(
+        "--init_url", type=str, default="tcp://127.0.0.1:29527", help="Initialization URL for distributed setup"
+    )
 
     return vars(parser.parse_args())
 
@@ -95,10 +103,8 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
     )
 
     shmem = iris.iris(args["heap_size"])
-
     rank = shmem.get_rank()
     world_size = shmem.get_num_ranks()
-
     # Datatype mapping
     datatype = torch.float32
     if args["datatype"] == "fp16":
@@ -253,8 +259,11 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 
     if args["benchmark"]:
         # Warmup for benchmarking
-        run_experiment()
-        shmem.barrier()
+        for k in ["all_reduce"]:
+            kernel_timing[k]["ms"] = 0
+            kernel_timing[k]["experiments"] = 0
+
+        iris.do_bench(run_experiment, shmem.barrier, n_warmup=25, n_repeat=1)
 
         for k in ["all_reduce"]:
             kernel_timing[k]["ms"] = 0
@@ -300,6 +309,53 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
         # Wait for all to finish benchmarking
         shmem.barrier()
 
+    # Benchmark RCCL (PyTorch all_reduce) for comparison
+    if args["benchmark_rccl"]:
+        shmem.info("Benchmarking PyTorch RCCL (all_reduce)...")
+
+        # Create PyTorch tensors (not on Iris heap)
+        pytorch_tensor = torch.zeros(M, N, dtype=datatype, device=f"cuda:{rank}")
+        pytorch_tensor.fill_(float(rank + 1))
+
+        # Warmup
+        for _ in range(10):
+            dist.all_reduce(pytorch_tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # Benchmark
+        pytorch_tensor.fill_(float(rank + 1))
+        dist.barrier()
+
+        def run_rccl_experiment():
+            dist.all_reduce(pytorch_tensor, op=dist.ReduceOp.SUM)
+
+        rccl_ms = iris.do_bench(run_rccl_experiment, dist.barrier)
+        element_size = torch.tensor([], dtype=datatype).element_size()
+        # RCCL all-reduce: same bandwidth calculation as Iris
+        # All-reduce moves 2 * (world_size - 1) / world_size * data_size bytes
+        total_bytes = M * N * element_size * (2 * (world_size - 1)) / world_size
+        total_bytes_gb = total_bytes / (1024**3)
+        rccl_bandwidth_gbps = total_bytes_gb / (rccl_ms * 1e-3)
+
+        shmem.info(
+            f"RCCL all_reduce (M={M}, N={N}, world_size={world_size}, dtype={args['datatype']}): "
+            f"{rccl_ms:.3f} ms, {rccl_bandwidth_gbps:.3f} GB/s"
+        )
+
+        if args["benchmark"]:
+            # Calculate performance ratio
+            iris_bandwidth = bandwidth_gbps
+            rccl_ratio = (iris_bandwidth / rccl_bandwidth_gbps) * 100 if rccl_bandwidth_gbps > 0 else 0
+            shmem.info(f"Performance ratio (Iris/RCCL): {rccl_ratio:.1f}%")
+
+            json_writer.add_field("rccl_bandwidth_gbps", rccl_bandwidth_gbps)
+            json_writer.add_field("rccl_ms", rccl_ms)
+            json_writer.add_field("rccl_ratio_percent", rccl_ratio)
+
+        # Wait for all to finish RCCL benchmarking
+        shmem.barrier()
+
     if rank == 0:
         if args["variant"] == "ring":
             json_writer.add_field("all_reduce_ring_slice_n", config.all_reduce_ring_slice_n)
@@ -313,7 +369,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args: dict):
 def main():
     args = parse_args()
     num_ranks = args["num_ranks"]
-    init_url = "tcp://127.0.0.1:29503"
+    init_url = args["init_url"]
 
     mp.spawn(
         fn=_worker,
