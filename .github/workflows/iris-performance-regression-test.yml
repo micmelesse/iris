@@ -17,7 +17,7 @@ env:
 jobs:
   build-container-image:
     runs-on: [self-hosted, mi3xx]
-    timeout-minutes: 20
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -43,7 +43,7 @@ jobs:
     name: ${{ matrix.example_name }}
     needs: build-container-image
     runs-on: [self-hosted, mi3xx]
-    timeout-minutes: 30
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -74,9 +74,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Cleanup lingering ports before tests
+      - name: Acquire GPUs
         run: |
-          bash .github/scripts/cleanup_ports.sh
+          bash .github/scripts/acquire_gpus.sh 8
 
       - name: Run ${{ matrix.example_name }} Benchmark (8 ranks)
         run: |
@@ -88,4 +88,9 @@ jobs:
             "${{ matrix.tflops_threshold }}" \
             ${{ matrix.benchmark_args }}
           echo "::endgroup::"
+
+      - name: Release GPUs
+        if: always()
+        run: |
+          bash .github/scripts/release_gpus.sh
 
