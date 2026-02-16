@@ -106,7 +106,12 @@ def test_barrier_cross_rank(barrier_type, op, num_barriers):
 
             # Read neighbor's buffer.
             _read_remote_kernel[(1,)](
-                buf, result, rank, neighbor, N, heap_bases,
+                buf,
+                result,
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
 
             for _ in range(num_barriers):
@@ -124,7 +129,12 @@ def test_barrier_cross_rank(barrier_type, op, num_barriers):
 
             # Each rank writes its rank ID into neighbor's buffer.
             _write_remote_kernel[(1,)](
-                buf, float(rank), rank, neighbor, N, heap_bases,
+                buf,
+                float(rank),
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
 
             for _ in range(num_barriers):
