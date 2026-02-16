@@ -2,6 +2,8 @@
 # Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
 import gc
+from typing import Literal
+
 import pytest
 import torch
 import triton
@@ -9,10 +11,11 @@ import triton.language as tl
 import iris
 
 
-BARRIER_TYPES = ["host", "device"]
+BarrierType = Literal["host", "device"]
+BARRIER_TYPES: list[BarrierType] = ["host", "device"]
 
 
-def _call_barrier(shmem, barrier_type):
+def _call_barrier(shmem: iris.Iris, barrier_type: BarrierType) -> None:
     if barrier_type == "host":
         shmem.barrier()
     else:
