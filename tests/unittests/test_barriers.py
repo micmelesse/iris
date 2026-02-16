@@ -90,7 +90,10 @@ def test_barrier_state_reuse(barrier_type):
         gc.collect()
 
 
-@pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
+# Host barrier is not graph-capturable (uses NCCL which crashes with
+# hipErrorStreamCaptureUnsupported on ROCm). Only test device barrier here.
+# To experiment with host, add "host" back to the parametrize list.
+@pytest.mark.parametrize("barrier_type", ["device"])
 def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
     shmem = iris.iris(1 << 20)
 
