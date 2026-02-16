@@ -4,6 +4,8 @@
 import gc
 import pytest
 import torch
+import triton
+import triton.language as tl
 import iris
 
 
@@ -15,6 +17,34 @@ def _call_barrier(shmem, barrier_type):
         shmem.barrier()
     else:
         shmem.device_barrier()
+
+
+@triton.jit
+def _read_remote_kernel(
+    buf_ptr,
+    result_ptr,
+    cur_rank: tl.constexpr,
+    remote_rank: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    heap_bases: tl.tensor,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    data = iris.load(buf_ptr + offsets, cur_rank, remote_rank, heap_bases)
+    tl.store(result_ptr + offsets, data)
+
+
+@triton.jit
+def _write_remote_kernel(
+    buf_ptr,
+    value,
+    cur_rank: tl.constexpr,
+    remote_rank: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    heap_bases: tl.tensor,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    data = tl.full([BLOCK_SIZE], value, dtype=tl.float32)
+    iris.store(buf_ptr + offsets, data, cur_rank, remote_rank, heap_bases)
 
 
 @pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
@@ -42,23 +72,66 @@ def test_barrier_multiple(barrier_type):
         gc.collect()
 
 
+@pytest.mark.parametrize("num_barriers", [1, 2, 4])
+@pytest.mark.parametrize("op", ["load", "store", "both"])
 @pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
-def test_barrier_synchronizes_data(barrier_type):
+def test_barrier_cross_rank(barrier_type, op, num_barriers):
+    """Verify cross-rank data visibility after barrier.
+
+    - load: each rank reads neighbor's buffer via iris.load()
+    - store: each rank writes to neighbor's buffer via iris.store()
+    - both: load and store in the same test
+
+    Parametrized over num_barriers to test idempotency: extra barriers
+    with no new work must not corrupt state or deadlock.
+    """
+    N = 256
     shmem = iris.iris(1 << 20)
     rank = shmem.get_rank()
+    num_ranks = shmem.get_num_ranks()
+    heap_bases = shmem.get_heap_bases()
+    neighbor = (rank + 1) % num_ranks
+    writer = (rank - 1 + num_ranks) % num_ranks
 
-    buf = shmem.zeros((256,), dtype=torch.float32)
+    buf = shmem.zeros((N,), dtype=torch.float32)
+    result = shmem.zeros((N,), dtype=torch.float32)
 
     try:
-        _call_barrier(shmem, barrier_type)
+        if op in ("load", "both"):
+            # Each rank writes its rank ID to its own buffer.
+            buf.fill_(float(rank))
 
-        if rank == 0:
-            buf.fill_(42.0)
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
 
-        _call_barrier(shmem, barrier_type)
+            # Read neighbor's buffer.
+            _read_remote_kernel[(1,)](
+                buf, result, rank, neighbor, N, heap_bases,
+            )
 
-        if rank == 0:
-            expected = torch.full((256,), 42.0, dtype=torch.float32, device="cuda")
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
+
+            expected = torch.full((N,), float(neighbor), dtype=torch.float32, device="cuda")
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+        if op in ("store", "both"):
+            # Reset buffer before store test.
+            buf.fill_(0.0)
+
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
+
+            # Each rank writes its rank ID into neighbor's buffer.
+            _write_remote_kernel[(1,)](
+                buf, float(rank), rank, neighbor, N, heap_bases,
+            )
+
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
+
+            # Each rank checks its own buffer was written by writer.
+            expected = torch.full((N,), float(writer), dtype=torch.float32, device="cuda")
             torch.testing.assert_close(buf, expected, rtol=0, atol=0)
     finally:
         shmem.barrier()
@@ -122,6 +195,8 @@ def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
             for _ in range(3):
                 graph.replay()
                 stream.synchronize()
+
+        _call_barrier(shmem, barrier_type)
     finally:
         shmem.barrier()
         del shmem
