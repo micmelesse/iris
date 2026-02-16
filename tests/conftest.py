@@ -7,6 +7,7 @@ from typing import Callable, Generator, Optional
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 
 
 @dataclass
@@ -30,6 +31,7 @@ def _save_and_destroy_pg() -> _ProcessGroupState:
     )
     torch.cuda.synchronize()
     dist.destroy_process_group()
+    c10d._world.group_count = 0
     return state
 
 
