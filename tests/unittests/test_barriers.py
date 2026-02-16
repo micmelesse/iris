@@ -89,8 +89,18 @@ def test_barrier_state_reuse(barrier_type):
 
 
 def _cross_rank_eager(
-    shmem, barrier_type, op, num_barriers, rounds,
-    N, rank, neighbor, writer, heap_bases, buf, result,
+    shmem,
+    barrier_type,
+    op,
+    num_barriers,
+    rounds,
+    N,
+    rank,
+    neighbor,
+    writer,
+    heap_bases,
+    buf,
+    result,
 ):
     if op == "load":
         for i in range(rounds):
@@ -100,7 +110,12 @@ def _cross_rank_eager(
                 _call_barrier(shmem, barrier_type)
 
             _read_remote_kernel[(1,)](
-                buf, result, rank, neighbor, N, heap_bases,
+                buf,
+                result,
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
 
             for _ in range(num_barriers):
@@ -118,7 +133,12 @@ def _cross_rank_eager(
 
             write_val = float(rank + i * 100)
             _write_remote_kernel[(1,)](
-                buf, write_val, rank, neighbor, N, heap_bases,
+                buf,
+                write_val,
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
 
             for _ in range(num_barriers):
@@ -130,8 +150,17 @@ def _cross_rank_eager(
 
 
 def _cross_rank_graph(
-    shmem, op, num_barriers, rounds,
-    N, rank, neighbor, writer, heap_bases, buf, result,
+    shmem,
+    op,
+    num_barriers,
+    rounds,
+    N,
+    rank,
+    neighbor,
+    writer,
+    heap_bases,
+    buf,
+    result,
 ):
     stream = torch.cuda.Stream()
 
@@ -143,7 +172,12 @@ def _cross_rank_graph(
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _read_remote_kernel[(1,)](
-                buf, result, rank, neighbor, N, heap_bases,
+                buf,
+                result,
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
             for _ in range(num_barriers):
                 shmem.device_barrier()
@@ -155,7 +189,12 @@ def _cross_rank_graph(
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _read_remote_kernel[(1,)](
-                buf, result, rank, neighbor, N, heap_bases,
+                buf,
+                result,
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
             for _ in range(num_barriers):
                 shmem.device_barrier()
@@ -170,8 +209,10 @@ def _cross_rank_graph(
             stream.synchronize()
 
             expected = torch.full(
-                (N,), float(neighbor + (i + 1) * 10),
-                dtype=torch.float32, device="cuda",
+                (N,),
+                float(neighbor + (i + 1) * 10),
+                dtype=torch.float32,
+                device="cuda",
             )
             torch.testing.assert_close(result, expected, rtol=0, atol=0)
     else:
@@ -182,7 +223,12 @@ def _cross_rank_graph(
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _write_remote_kernel[(1,)](
-                buf, float(rank), rank, neighbor, N, heap_bases,
+                buf,
+                float(rank),
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
             for _ in range(num_barriers):
                 shmem.device_barrier()
@@ -194,7 +240,12 @@ def _cross_rank_graph(
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _write_remote_kernel[(1,)](
-                buf, float(rank), rank, neighbor, N, heap_bases,
+                buf,
+                float(rank),
+                rank,
+                neighbor,
+                N,
+                heap_bases,
             )
             for _ in range(num_barriers):
                 shmem.device_barrier()
@@ -251,13 +302,32 @@ def test_barrier_cross_rank(barrier_type, op, mode, num_barriers, N, rounds=3):
         for single_op in ops:
             if mode == "eager":
                 _cross_rank_eager(
-                    shmem, barrier_type, single_op, num_barriers, rounds,
-                    N, rank, neighbor, writer, heap_bases, buf, result,
+                    shmem,
+                    barrier_type,
+                    single_op,
+                    num_barriers,
+                    rounds,
+                    N,
+                    rank,
+                    neighbor,
+                    writer,
+                    heap_bases,
+                    buf,
+                    result,
                 )
             else:
                 _cross_rank_graph(
-                    shmem, single_op, num_barriers, rounds,
-                    N, rank, neighbor, writer, heap_bases, buf, result,
+                    shmem,
+                    single_op,
+                    num_barriers,
+                    rounds,
+                    N,
+                    rank,
+                    neighbor,
+                    writer,
+                    heap_bases,
+                    buf,
+                    result,
                 )
     finally:
         shmem.barrier()
