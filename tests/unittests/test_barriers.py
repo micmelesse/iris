@@ -105,15 +105,16 @@ def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
             _call_barrier(shmem, barrier_type)
         stream.synchronize()
 
-        # Destroy the NCCL process group before graph capture. On ROCm
-        # the watchdog calls hipEventQuery which crashes with
-        # hipErrorStreamCaptureUnsupported when any stream is capturing.
-        destroy_pg()
-
         if barrier_type == "host":
+            # Host barrier needs PG destroyed to stop the NCCL watchdog
+            # which crashes with hipErrorStreamCaptureUnsupported on ROCm.
+            # PG destroy/recreate is broken upstream (pytorch#55967,
+            # #66547, #119196) so this path is disabled by default.
+            destroy_pg()
             with pytest.raises(Exception):
                 with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
                     _call_barrier(shmem, barrier_type)
+            recreate_pg()
         else:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
@@ -122,7 +123,6 @@ def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
                 graph.replay()
                 stream.synchronize()
     finally:
-        recreate_pg()
         shmem.barrier()
         del shmem
         gc.collect()
