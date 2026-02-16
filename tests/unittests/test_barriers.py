@@ -66,6 +66,30 @@ def test_barrier_synchronizes_data(barrier_type):
         gc.collect()
 
 
+@pytest.mark.parametrize(
+    "barrier_type",
+    [
+        pytest.param("host", marks=pytest.mark.skip(reason="Host barrier has no reusable state")),
+        "device",
+    ],
+)
+def test_barrier_state_reuse(barrier_type):
+    shmem = iris.iris(1 << 20)
+
+    try:
+        _call_barrier(shmem, barrier_type)
+        assert None in shmem._device_barrier_state
+        flags_ptr = shmem._device_barrier_state[None][0].data_ptr()
+
+        _call_barrier(shmem, barrier_type)
+        assert shmem._device_barrier_state[None][0].data_ptr() == flags_ptr
+        assert shmem._device_barrier_state[None][1] == 2
+    finally:
+        shmem.barrier()
+        del shmem
+        gc.collect()
+
+
 @pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
 def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
     shmem = iris.iris(1 << 20)
@@ -96,30 +120,6 @@ def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
                 stream.synchronize()
     finally:
         recreate_pg()
-        shmem.barrier()
-        del shmem
-        gc.collect()
-
-
-@pytest.mark.parametrize(
-    "barrier_type",
-    [
-        pytest.param("host", marks=pytest.mark.skip(reason="Host barrier has no reusable state")),
-        "device",
-    ],
-)
-def test_barrier_state_reuse(barrier_type):
-    shmem = iris.iris(1 << 20)
-
-    try:
-        _call_barrier(shmem, barrier_type)
-        assert None in shmem._device_barrier_state
-        flags_ptr = shmem._device_barrier_state[None][0].data_ptr()
-
-        _call_barrier(shmem, barrier_type)
-        assert shmem._device_barrier_state[None][0].data_ptr() == flags_ptr
-        assert shmem._device_barrier_state[None][1] == 2
-    finally:
         shmem.barrier()
         del shmem
         gc.collect()
