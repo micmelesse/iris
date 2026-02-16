@@ -50,102 +50,14 @@ def _write_remote_kernel(
     iris.store(buf_ptr + offsets, data, cur_rank, remote_rank, heap_bases)
 
 
+@pytest.mark.parametrize("n", [1, 10])
 @pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
-def test_barrier_basic(barrier_type):
+def test_barrier_basic(barrier_type, n):
     shmem = iris.iris(1 << 20)
 
     try:
-        _call_barrier(shmem, barrier_type)
-    finally:
-        shmem.barrier()
-        del shmem
-        gc.collect()
-
-
-@pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
-def test_barrier_multiple(barrier_type):
-    shmem = iris.iris(1 << 20)
-
-    try:
-        for _ in range(10):
+        for _ in range(n):
             _call_barrier(shmem, barrier_type)
-    finally:
-        shmem.barrier()
-        del shmem
-        gc.collect()
-
-
-@pytest.mark.parametrize("num_barriers", [1, 2, 4])
-@pytest.mark.parametrize("op", ["load", "store", "both"])
-@pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
-def test_barrier_cross_rank(barrier_type, op, num_barriers):
-    """Verify cross-rank data visibility after barrier.
-
-    - load: each rank reads neighbor's buffer via iris.load()
-    - store: each rank writes to neighbor's buffer via iris.store()
-    - both: load and store in the same test
-
-    Parametrized over num_barriers to test idempotency: extra barriers
-    with no new work must not corrupt state or deadlock.
-    """
-    N = 256
-    shmem = iris.iris(1 << 20)
-    rank = shmem.get_rank()
-    num_ranks = shmem.get_num_ranks()
-    heap_bases = shmem.get_heap_bases()
-    neighbor = (rank + 1) % num_ranks
-    writer = (rank - 1 + num_ranks) % num_ranks
-
-    buf = shmem.zeros((N,), dtype=torch.float32)
-    result = shmem.zeros((N,), dtype=torch.float32)
-
-    try:
-        if op in ("load", "both"):
-            # Each rank writes its rank ID to its own buffer.
-            buf.fill_(float(rank))
-
-            for _ in range(num_barriers):
-                _call_barrier(shmem, barrier_type)
-
-            # Read neighbor's buffer.
-            _read_remote_kernel[(1,)](
-                buf,
-                result,
-                rank,
-                neighbor,
-                N,
-                heap_bases,
-            )
-
-            for _ in range(num_barriers):
-                _call_barrier(shmem, barrier_type)
-
-            expected = torch.full((N,), float(neighbor), dtype=torch.float32, device="cuda")
-            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-
-        if op in ("store", "both"):
-            # Reset buffer before store test.
-            buf.fill_(0.0)
-
-            for _ in range(num_barriers):
-                _call_barrier(shmem, barrier_type)
-
-            # Each rank writes its rank ID into neighbor's buffer.
-            _write_remote_kernel[(1,)](
-                buf,
-                float(rank),
-                rank,
-                neighbor,
-                N,
-                heap_bases,
-            )
-
-            for _ in range(num_barriers):
-                _call_barrier(shmem, barrier_type)
-
-            # Each rank checks its own buffer was written by writer.
-            expected = torch.full((N,), float(writer), dtype=torch.float32, device="cuda")
-            torch.testing.assert_close(buf, expected, rtol=0, atol=0)
     finally:
         shmem.barrier()
         del shmem
@@ -176,40 +88,177 @@ def test_barrier_state_reuse(barrier_type):
         gc.collect()
 
 
-# Host barrier is not graph-capturable (uses NCCL which crashes with
-# hipErrorStreamCaptureUnsupported on ROCm). Only test device barrier here.
-# To experiment with host, add "host" back to the parametrize list.
-@pytest.mark.parametrize("barrier_type", ["device"])
-def test_barrier_graph_capture(barrier_type, destroy_pg, recreate_pg):
-    shmem = iris.iris(1 << 20)
+def _cross_rank_eager(
+    shmem, barrier_type, op, num_barriers, rounds,
+    N, rank, neighbor, writer, heap_bases, buf, result,
+):
+    if op == "load":
+        for i in range(rounds):
+            buf.fill_(float(rank + i * 100))
 
-    try:
-        _call_barrier(shmem, barrier_type)
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
 
-        stream = torch.cuda.Stream()
+            _read_remote_kernel[(1,)](
+                buf, result, rank, neighbor, N, heap_bases,
+            )
+
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
+
+            expected_val = float(neighbor + i * 100)
+            expected = torch.full((N,), expected_val, dtype=torch.float32, device="cuda")
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    else:
+        for i in range(rounds):
+            buf.fill_(0.0)
+
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
+
+            write_val = float(rank + i * 100)
+            _write_remote_kernel[(1,)](
+                buf, write_val, rank, neighbor, N, heap_bases,
+            )
+
+            for _ in range(num_barriers):
+                _call_barrier(shmem, barrier_type)
+
+            expected_val = float(writer + i * 100)
+            expected = torch.full((N,), expected_val, dtype=torch.float32, device="cuda")
+            torch.testing.assert_close(buf, expected, rtol=0, atol=0)
+
+
+def _cross_rank_graph(
+    shmem, op, num_barriers, rounds,
+    N, rank, neighbor, writer, heap_bases, buf, result,
+):
+    stream = torch.cuda.Stream()
+
+    if op == "load":
+        buf.fill_(float(rank))
+
+        # Warmup on capture stream.
         with torch.cuda.stream(stream):
-            _call_barrier(shmem, barrier_type)
+            for _ in range(num_barriers):
+                shmem.device_barrier()
+            _read_remote_kernel[(1,)](
+                buf, result, rank, neighbor, N, heap_bases,
+            )
+            for _ in range(num_barriers):
+                shmem.device_barrier()
         stream.synchronize()
 
-        if barrier_type == "host":
-            # Host barrier needs PG destroyed to stop the NCCL watchdog
-            # which crashes with hipErrorStreamCaptureUnsupported on ROCm.
-            # PG destroy/recreate is broken upstream (pytorch#55967,
-            # #66547, #119196) so this path is disabled by default.
-            destroy_pg()
-            with pytest.raises(Exception):
-                with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
-                    _call_barrier(shmem, barrier_type)
-            recreate_pg()
-        else:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                _call_barrier(shmem, barrier_type)
-            for _ in range(3):
-                graph.replay()
-                stream.synchronize()
+        # Capture.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(num_barriers):
+                shmem.device_barrier()
+            _read_remote_kernel[(1,)](
+                buf, result, rank, neighbor, N, heap_bases,
+            )
+            for _ in range(num_barriers):
+                shmem.device_barrier()
 
-        _call_barrier(shmem, barrier_type)
+        # Replay with fresh data.
+        for i in range(rounds):
+            val = float(rank + (i + 1) * 10)
+            buf.fill_(val)
+            shmem.device_barrier()
+
+            graph.replay()
+            stream.synchronize()
+
+            expected = torch.full(
+                (N,), float(neighbor + (i + 1) * 10),
+                dtype=torch.float32, device="cuda",
+            )
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    else:
+        buf.fill_(0.0)
+
+        # Warmup on capture stream.
+        with torch.cuda.stream(stream):
+            for _ in range(num_barriers):
+                shmem.device_barrier()
+            _write_remote_kernel[(1,)](
+                buf, float(rank), rank, neighbor, N, heap_bases,
+            )
+            for _ in range(num_barriers):
+                shmem.device_barrier()
+        stream.synchronize()
+
+        # Capture.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(num_barriers):
+                shmem.device_barrier()
+            _write_remote_kernel[(1,)](
+                buf, float(rank), rank, neighbor, N, heap_bases,
+            )
+            for _ in range(num_barriers):
+                shmem.device_barrier()
+
+        # Replay and verify.
+        for _ in range(rounds):
+            buf.fill_(0.0)
+            shmem.device_barrier()
+
+            graph.replay()
+            stream.synchronize()
+
+            shmem.device_barrier()
+            expected = torch.full((N,), float(writer), dtype=torch.float32, device="cuda")
+            torch.testing.assert_close(buf, expected, rtol=0, atol=0)
+
+
+# Host barrier is not graph-capturable (uses NCCL which crashes with
+# hipErrorStreamCaptureUnsupported on ROCm). Skip host+graph combos.
+@pytest.mark.parametrize("N", [1, 64, 256, 1024])
+@pytest.mark.parametrize("num_barriers", [1, 2, 4])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+@pytest.mark.parametrize("op", ["load", "store", "both"])
+@pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
+def test_barrier_cross_rank(barrier_type, op, mode, num_barriers, N, rounds=3):
+    """Verify cross-rank data visibility after barrier.
+
+    - op: load (iris.load from neighbor), store (iris.store to neighbor), or both
+    - mode: eager (direct calls) or graph (CUDA graph capture + replay)
+    - num_barriers: consecutive barriers to test idempotency
+    - N: number of elements (must be power of 2 for Triton BLOCK_SIZE)
+    - rounds: number of iterations with changing data (default 3)
+
+    Each mode runs multiple rounds with changing data to stress correctness.
+    Graph mode captures barrier + kernel into a CUDA graph, then replays
+    with fresh data to verify correctness through the captured graph.
+    """
+    if mode == "graph" and barrier_type == "host":
+        pytest.skip("Host barrier is not CUDA graph capturable")
+
+    shmem = iris.iris(1 << 20)
+    rank = shmem.get_rank()
+    num_ranks = shmem.get_num_ranks()
+    heap_bases = shmem.get_heap_bases()
+    neighbor = (rank + 1) % num_ranks
+    writer = (rank - 1 + num_ranks) % num_ranks
+
+    buf = shmem.zeros((N,), dtype=torch.float32)
+    result = shmem.zeros((N,), dtype=torch.float32)
+
+    ops = ["load", "store"] if op == "both" else [op]
+
+    try:
+        for single_op in ops:
+            if mode == "eager":
+                _cross_rank_eager(
+                    shmem, barrier_type, single_op, num_barriers, rounds,
+                    N, rank, neighbor, writer, heap_bases, buf, result,
+                )
+            else:
+                _cross_rank_graph(
+                    shmem, single_op, num_barriers, rounds,
+                    N, rank, neighbor, writer, heap_bases, buf, result,
+                )
     finally:
         shmem.barrier()
         del shmem
