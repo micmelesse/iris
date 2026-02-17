@@ -56,7 +56,6 @@ def all_reduce_preamble(
     shmem,
     config: Optional[Config] = None,
     workspace: Optional[AllReduceWorkspace] = None,
-    group=None,
 ):
     """
     Allocate and reset temporary buffers for the chosen variant.
@@ -87,7 +86,7 @@ def all_reduce_preamble(
 
     if variant in (VARIANT_ATOMIC, VARIANT_SPINLOCK, VARIANT_ONE_SHOT):
         output_tensor.zero_()
-        shmem.device_barrier(group=group)
+        shmem.barrier()
 
     elif variant == VARIANT_RING:
         num_pid_m = (M + config.block_size_m - 1) // config.block_size_m
@@ -110,7 +109,7 @@ def all_reduce_preamble(
             workspace.flags.zero_()
 
         output_tensor.zero_()
-        shmem.device_barrier(group=group)
+        shmem.barrier()
 
     elif variant == VARIANT_TWO_SHOT:
         pass
@@ -797,7 +796,6 @@ def all_reduce(
             shmem,
             config=config,
             workspace=workspace,
-            group=group,
         )
 
     heap_bases = shmem.get_heap_bases()
@@ -959,6 +957,6 @@ def all_reduce(
         workspace.prepared = False
 
     if not async_op:
-        shmem.device_barrier(group=group)
+        shmem.barrier()
 
     return workspace
