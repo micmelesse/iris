@@ -344,6 +344,7 @@ class DeviceBarrierState:
     Allocated once on first use, then reused across calls. The flags
     tensor lives on the symmetric heap so all ranks can poll it.
     """
+
     flags: torch.Tensor
     epoch: int = 0
 

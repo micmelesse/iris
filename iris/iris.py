@@ -1273,8 +1273,12 @@ class Iris:
 
         state = self._device_barrier_state[group]
         state.epoch = distributed_device_barrier(
-            state.flags, state.epoch, group,
-            self.cur_rank, self.num_ranks, self.get_heap_bases(),
+            state.flags,
+            state.epoch,
+            group,
+            self.cur_rank,
+            self.num_ranks,
+            self.get_heap_bases(),
         )
 
     def get_device(self):
