@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
 import gc
+import warnings
 from typing import Literal
 
 import pytest
@@ -64,24 +65,22 @@ def test_barrier_basic(barrier_type, n):
         gc.collect()
 
 
-@pytest.mark.parametrize(
-    "barrier_type",
-    [
-        pytest.param("host", marks=pytest.mark.skip(reason="Host barrier has no reusable state")),
-        "device",
-    ],
-)
-def test_barrier_state_reuse(barrier_type):
+@pytest.mark.parametrize("n", [1, 2, 5, 10])
+def test_barrier_state_reuse(n):
+    """Verify device barrier reuses flags tensor and increments epoch."""
     shmem = iris.iris(1 << 20)
 
     try:
-        _call_barrier(shmem, barrier_type)
+        shmem.device_barrier()
         assert None in shmem._device_barrier_state
-        flags_ptr = shmem._device_barrier_state[None][0].data_ptr()
+        state = shmem._device_barrier_state[None]
+        flags_ptr = state.flags.data_ptr()
+        assert state.epoch == 1
 
-        _call_barrier(shmem, barrier_type)
-        assert shmem._device_barrier_state[None][0].data_ptr() == flags_ptr
-        assert shmem._device_barrier_state[None][1] == 2
+        for i in range(2, n + 1):
+            shmem.device_barrier()
+            assert state.flags.data_ptr() == flags_ptr
+            assert state.epoch == i
     finally:
         shmem.barrier()
         del shmem
@@ -284,7 +283,8 @@ def test_barrier_cross_rank(barrier_type, op, mode, num_barriers, N, rounds=3):
     with fresh data to verify correctness through the captured graph.
     """
     if mode == "graph" and barrier_type == "host":
-        pytest.skip("Host barrier is not CUDA graph capturable")
+        warnings.warn("Host barrier uses NCCL which may crash during CUDA graph capture on ROCm")
+        # pytest.skip("Host barrier is not CUDA graph capturable")
 
     shmem = iris.iris(1 << 20)
     rank = shmem.get_rank()

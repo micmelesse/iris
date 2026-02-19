@@ -46,6 +46,7 @@ from iris._distributed_helpers import (
     init_distributed,
     distributed_barrier,
     distributed_device_barrier,
+    DeviceBarrierState,
     distributed_broadcast_scalar,
     distributed_broadcast_tensor,
 )
@@ -57,6 +58,7 @@ from iris.hip import (
 from iris.symmetric_heap import SymmetricHeap
 import numpy as np
 import math
+from typing import Any, Dict
 import torch
 import logging
 
@@ -113,8 +115,8 @@ class Iris:
         # Lazy initialization for ops interface
         self._ops = None
 
-        # Device-side barrier state: keyed by group, each entry is (flags_tensor, epoch)
-        self._device_barrier_state = {}
+        # Device-side barrier state, keyed by process group (None = all ranks).
+        self._device_barrier_state: Dict[Any, DeviceBarrierState] = {}
 
         # Initialize tracing
         self.tracing = Tracing(self)
@@ -1265,14 +1267,14 @@ class Iris:
             >>> ctx = iris.iris(1 << 20)
             >>> ctx.device_barrier()  # Synchronize all ranks on device
         """
-        key = group
-        if key not in self._device_barrier_state:
+        if group not in self._device_barrier_state:
             flags = self.zeros((self.num_ranks,), dtype=torch.int32)
-            self._device_barrier_state[key] = [flags, 0]
+            self._device_barrier_state[group] = DeviceBarrierState(flags=flags)
 
-        state = self._device_barrier_state[key]
-        state[1] = distributed_device_barrier(
-            state[0], state[1], group, self.cur_rank, self.num_ranks, self.get_heap_bases()
+        state = self._device_barrier_state[group]
+        state.epoch = distributed_device_barrier(
+            state.flags, state.epoch, group,
+            self.cur_rank, self.num_ranks, self.get_heap_bases(),
         )
 
     def get_device(self):
@@ -1687,7 +1689,7 @@ class Iris:
 
             _all_gather(output_tensor, input_tensor, self._iris, group=group, async_op=async_op, config=config)
 
-        def all_reduce_preamble(self, output_tensor, input_tensor, config=None, workspace=None, group=None):
+        def all_reduce_preamble(self, output_tensor, input_tensor, config=None, workspace=None):
             """
             Prepare reusable workspace for all-reduce.
 
@@ -1696,7 +1698,6 @@ class Iris:
                 input_tensor: Input tensor providing the local contribution.
                 config: Optional Config describing variant parameters.
                 workspace: Optional existing workspace to update/reuse.
-                group: Optional ProcessGroup for group-aware barrier synchronization.
 
             Returns:
                 Workspace object that can be passed to ``all_reduce``.
@@ -1709,7 +1710,6 @@ class Iris:
                 self._iris,
                 config=config,
                 workspace=workspace,
-                group=group,
             )
 
         def all_reduce(

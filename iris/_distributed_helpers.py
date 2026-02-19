@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
+from dataclasses import dataclass
+
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -333,6 +335,17 @@ def _device_barrier_kernel(
                 tl.atomic_cas(remote_translated, target_epoch, target_epoch, sem="acquire", scope="sys") != target_epoch
             ):
                 pass
+
+
+@dataclass
+class DeviceBarrierState:
+    """State for a device-side barrier on a specific process group.
+
+    Allocated once on first use, then reused across calls. The flags
+    tensor lives on the symmetric heap so all ranks can poll it.
+    """
+    flags: torch.Tensor
+    epoch: int = 0
 
 
 def distributed_device_barrier(flags, epoch, group, rank, num_ranks, heap_bases):
