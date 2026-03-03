@@ -332,8 +332,7 @@ def _device_barrier_kernel(
             remote_flag_ptr = flags_ptr + remote_rank
             remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
             while (
-                tl.atomic_cas(remote_translated, target_epoch, target_epoch, sem="acquire", scope="sys")
-                != target_epoch
+                tl.atomic_cas(remote_translated, target_epoch, target_epoch, sem="acquire", scope="sys") != target_epoch
             ):
                 pass
 
