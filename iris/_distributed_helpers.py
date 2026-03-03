@@ -310,29 +310,32 @@ def _device_barrier_kernel(
     """
     Device-side barrier kernel using atomic operations on the symmetric heap.
 
-    Launched with grid=(world_size,). Each CTA handles one rank:
-    - CTA 0: signals this rank's readiness (atomic_xchg, release)
-    - All CTAs: each polls one remote rank (atomic_cas, acquire)
+    Launched with grid=(1,). A single CTA:
+    1. Signals this rank's readiness (atomic_xchg, release)
+    2. Serially polls each remote rank (atomic_cas, acquire)
 
-    All polls run in parallel across CTAs, reducing barrier latency
-    from O(world_size) serial round-trips to O(1).
+    Note: parallel polling (grid=world_size, one CTA per rank) was tested
+    but caused 6x regression (42us vs 7us) due to fabric contention from
+    concurrent cross-rank atomics on ROCm/MI300X.
     """
     target_epoch = epoch + 1
-    pid = tl.program_id(0)
-    remote_rank = rank_start + pid * rank_stride
 
-    # CTA 0: signal own readiness by writing target_epoch to own flag slot
-    if pid == 0:
-        own_flag_ptr = flags_ptr + iris_rank
-        own_translated = _translate_ptr(own_flag_ptr, iris_rank, iris_rank, heap_bases)
-        tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
+    # Signal own readiness
+    own_flag_ptr = flags_ptr + iris_rank
+    own_translated = _translate_ptr(own_flag_ptr, iris_rank, iris_rank, heap_bases)
+    tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
 
-    # Each CTA polls one remote rank's flag until it reaches target_epoch
-    if remote_rank != iris_rank:
-        remote_flag_ptr = flags_ptr + remote_rank
-        remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
-        while tl.atomic_cas(remote_translated, target_epoch, target_epoch, sem="acquire", scope="sys") != target_epoch:
-            pass
+    # Poll each remote rank serially
+    for i in tl.static_range(world_size):
+        remote_rank = rank_start + i * rank_stride
+        if remote_rank != iris_rank:
+            remote_flag_ptr = flags_ptr + remote_rank
+            remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
+            while (
+                tl.atomic_cas(remote_translated, target_epoch, target_epoch, sem="acquire", scope="sys")
+                != target_epoch
+            ):
+                pass
 
 
 @dataclass
@@ -352,9 +355,8 @@ def distributed_device_barrier(flags, epoch, group, rank, num_ranks, heap_bases)
     Device-side barrier using atomic operations on the symmetric heap.
 
     Unlike ``distributed_barrier`` which uses host-side ``torch.distributed.barrier()``,
-    this launches a Triton kernel with one CTA per rank that synchronizes via
+    this launches a single-CTA Triton kernel that synchronizes via
     device-side atomics, making it safe to use during CUDA graph capture.
-    All remote polls run in parallel (O(1) latency instead of O(world_size)).
 
     Args:
         flags: int32 tensor on symmetric heap, one element per rank.
@@ -368,7 +370,7 @@ def distributed_device_barrier(flags, epoch, group, rank, num_ranks, heap_bases)
         int: The next epoch value (epoch + 1).
     """
     _, rank_global, world_size, rank_start, rank_stride = extract_group_info(group, rank, num_ranks)
-    _device_barrier_kernel[(world_size,)](
+    _device_barrier_kernel[(1,)](
         flags,
         epoch,
         rank_global,
