@@ -1271,6 +1271,10 @@ class Iris:
             flags = self.zeros((self.num_ranks,), dtype=torch.int32)
             self._device_barrier_state[group] = DeviceBarrierState(flags=flags)
 
+        # No-op during graph capture
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         state = self._device_barrier_state[group]
         state.epoch = distributed_device_barrier(
             state.flags,
