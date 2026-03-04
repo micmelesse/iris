@@ -116,6 +116,7 @@ class Iris:
 
         # Device-side barrier state, keyed by process group (None = all ranks).
         self._device_barrier_state: Dict[Any, torch.Tensor] = {}
+        self._device_barrier_count: int = 0
 
         # Initialize tracing
         self.tracing = Tracing(self)
@@ -1267,6 +1268,13 @@ class Iris:
         """
         if group not in self._device_barrier_state:
             self._device_barrier_state[group] = self.zeros((self.num_ranks,), dtype=torch.int32)
+
+        self._device_barrier_count += 1
+        capturing = torch.cuda.is_current_stream_capturing()
+        logger.info(
+            "device_barrier rank=%d call=%d capturing=%s",
+            self.cur_rank, self._device_barrier_count, capturing,
+        )
 
         distributed_device_barrier(
             self._device_barrier_state[group],
