@@ -326,7 +326,7 @@ def _device_barrier_kernel(
     tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
 
     # Poll each remote rank serially
-    for i in tl.static_range(world_size):
+    for i in range(world_size):
         remote_rank = rank_start + i * rank_stride
         if remote_rank != iris_rank:
             remote_flag_ptr = flags_ptr + remote_rank
