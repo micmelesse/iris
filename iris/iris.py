@@ -46,7 +46,6 @@ from iris._distributed_helpers import (
     init_distributed,
     distributed_barrier,
     distributed_device_barrier,
-    DeviceBarrierState,
     distributed_broadcast_scalar,
     distributed_broadcast_tensor,
 )
@@ -116,7 +115,7 @@ class Iris:
         self._ops = None
 
         # Device-side barrier state, keyed by process group (None = all ranks).
-        self._device_barrier_state: Dict[Any, DeviceBarrierState] = {}
+        self._device_barrier_state: Dict[Any, torch.Tensor] = {}
 
         # Initialize tracing
         self.tracing = Tracing(self)
@@ -1251,13 +1250,12 @@ class Iris:
 
     def device_barrier(self, group=None):
         """
-        Device-side barrier that is CUDA graph capturable.
+        Stateless device-side barrier that is CUDA graph capturable.
 
         Unlike ``barrier()`` which uses host-side ``torch.distributed.barrier()``,
         this uses device-side atomic operations on the symmetric heap to synchronize
-        ranks. This makes it safe to use during CUDA graph capture.
-
-        Flags and epoch state are managed internally, keyed by process group.
+        ranks. No CPU-side epoch tracking -- each rank's flag on the heap serves
+        as its own epoch counter, managed entirely by the GPU via atomic_add.
 
         Args:
             group (ProcessGroup, optional): The process group to synchronize.
@@ -1268,17 +1266,12 @@ class Iris:
             >>> ctx.device_barrier()  # Synchronize all ranks on device
         """
         if group not in self._device_barrier_state:
-            flags = self.zeros((self.num_ranks,), dtype=torch.int32)
-            self._device_barrier_state[group] = DeviceBarrierState(flags=flags)
+            self._device_barrier_state[group] = self.zeros(
+                (self.num_ranks,), dtype=torch.int32
+            )
 
-        # No-op during graph capture
-        if torch.cuda.is_current_stream_capturing():
-            return
-
-        state = self._device_barrier_state[group]
-        state.epoch = distributed_device_barrier(
-            state.flags,
-            state.epoch,
+        distributed_device_barrier(
+            self._device_barrier_state[group],
             group,
             self.cur_rank,
             self.num_ranks,

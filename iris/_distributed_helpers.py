@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
-from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -300,7 +299,6 @@ def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
 @triton.jit
 def _device_barrier_kernel(
     flags_ptr,
-    epoch,
     iris_rank,
     world_size: tl.constexpr,
     rank_start,
@@ -308,77 +306,74 @@ def _device_barrier_kernel(
     heap_bases,
 ):
     """
-    Device-side barrier kernel using atomic operations on the symmetric heap.
+    Stateless device-side barrier using atomic operations on the symmetric heap.
 
     Launched with grid=(1,). A single CTA:
-    1. Signals this rank's readiness (atomic_xchg, release)
-    2. Serially polls each remote rank (atomic_cas, acquire)
+    1. Atomically increments its own flag (atomic_add, release)
+    2. Serially polls each remote rank's flag for the same value (acquire)
 
-    Note: parallel polling (grid=world_size, one CTA per rank) was tested
-    but caused 6x regression (42us vs 7us) due to fabric contention from
-    concurrent cross-rank atomics on ROCm/MI300X.
+    No CPU-side epoch tracking. Each rank's flag IS the epoch, managed
+    entirely on the GPU via atomic_add. This makes the barrier safe for
+    CUDA graph capture: during recording the kernel is just recorded,
+    during replay all ranks increment together.
     """
-    target_epoch = epoch + 1
-
-    # Signal own readiness
+    # Increment own flag and determine target
     own_flag_ptr = flags_ptr + iris_rank
     own_translated = _translate_ptr(own_flag_ptr, iris_rank, iris_rank, heap_bases)
-    tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
+    old = tl.atomic_add(own_translated, 1, sem="release", scope="sys")
+    target = old + 1
 
     # Poll each remote rank serially
     for i in range(world_size):
         remote_rank = rank_start + i * rank_stride
         if remote_rank != iris_rank:
             remote_flag_ptr = flags_ptr + remote_rank
-            remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
+            remote_translated = _translate_ptr(
+                remote_flag_ptr, iris_rank, remote_rank, heap_bases
+            )
             while (
-                tl.atomic_cas(remote_translated, target_epoch, target_epoch, sem="acquire", scope="sys") != target_epoch
+                tl.atomic_cas(
+                    remote_translated,
+                    target,
+                    target,
+                    sem="acquire",
+                    scope="sys",
+                )
+                != target
             ):
                 pass
 
 
-@dataclass
-class DeviceBarrierState:
-    """State for a device-side barrier on a specific process group.
-
-    Allocated once on first use, then reused across calls. The flags
-    tensor lives on the symmetric heap so all ranks can poll it.
+def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
     """
-
-    flags: torch.Tensor
-    epoch: int = 0
-
-
-def distributed_device_barrier(flags, epoch, group, rank, num_ranks, heap_bases):
-    """
-    Device-side barrier using atomic operations on the symmetric heap.
+    Stateless device-side barrier using atomic operations on the symmetric heap.
 
     Unlike ``distributed_barrier`` which uses host-side ``torch.distributed.barrier()``,
     this launches a single-CTA Triton kernel that synchronizes via
     device-side atomics, making it safe to use during CUDA graph capture.
 
+    No CPU-side epoch tracking is needed. Each rank's flag on the symmetric
+    heap serves as its own epoch counter, managed entirely by the GPU via
+    atomic_add.
+
     Args:
         flags: int32 tensor on symmetric heap, one element per rank.
-        epoch: Current epoch counter (monotonically increasing).
         group: ProcessGroup or None. If None, uses all ranks.
         rank: Global rank of this process.
         num_ranks: Total number of ranks in the default group.
         heap_bases: Tensor of heap base addresses for all ranks.
-
-    Returns:
-        int: The next epoch value (epoch + 1).
     """
-    _, rank_global, world_size, rank_start, rank_stride = extract_group_info(group, rank, num_ranks)
+    _, rank_global, world_size, rank_start, rank_stride = extract_group_info(
+        group, rank, num_ranks
+    )
     _device_barrier_kernel[(1,)](
         flags,
-        epoch,
         rank_global,
         world_size,
         rank_start,
         rank_stride,
         heap_bases,
     )
-    return epoch + 1
 
 
 def init_distributed():
