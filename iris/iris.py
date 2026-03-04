@@ -1278,6 +1278,12 @@ class Iris:
             capturing,
         )
 
+        # During CUDA graph capture, kernels are recorded but not executed.
+        # Launching the barrier would record a non-executing atomic_add,
+        # causing flag drift between the warmup and capture phases.
+        if capturing:
+            return
+
         distributed_device_barrier(
             self._device_barrier_state[group],
             group,
