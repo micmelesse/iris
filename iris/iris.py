@@ -1273,7 +1273,9 @@ class Iris:
         capturing = torch.cuda.is_current_stream_capturing()
         logger.info(
             "device_barrier rank=%d call=%d capturing=%s",
-            self.cur_rank, self._device_barrier_count, capturing,
+            self.cur_rank,
+            self._device_barrier_count,
+            capturing,
         )
 
         distributed_device_barrier(
