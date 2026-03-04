@@ -1266,9 +1266,7 @@ class Iris:
             >>> ctx.device_barrier()  # Synchronize all ranks on device
         """
         if group not in self._device_barrier_state:
-            self._device_barrier_state[group] = self.zeros(
-                (self.num_ranks,), dtype=torch.int32
-            )
+            self._device_barrier_state[group] = self.zeros((self.num_ranks,), dtype=torch.int32)
 
         distributed_device_barrier(
             self._device_barrier_state[group],

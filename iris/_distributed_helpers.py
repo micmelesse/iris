@@ -328,9 +328,7 @@ def _device_barrier_kernel(
         remote_rank = rank_start + i * rank_stride
         if remote_rank != iris_rank:
             remote_flag_ptr = flags_ptr + remote_rank
-            remote_translated = _translate_ptr(
-                remote_flag_ptr, iris_rank, remote_rank, heap_bases
-            )
+            remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
             while (
                 tl.atomic_cas(
                     remote_translated,
@@ -363,9 +361,7 @@ def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
         num_ranks: Total number of ranks in the default group.
         heap_bases: Tensor of heap base addresses for all ranks.
     """
-    _, rank_global, world_size, rank_start, rank_stride = extract_group_info(
-        group, rank, num_ranks
-    )
+    _, rank_global, world_size, rank_start, rank_stride = extract_group_info(group, rank, num_ranks)
     _device_barrier_kernel[(1,)](
         flags,
         rank_global,
