@@ -137,6 +137,7 @@ def persistent_all_gather(
                     target_rank,
                     heap_bases,
                     mask=combined_mask,
+                    hint=(1, BLOCK_SIZE_N),
                 )
 
 
@@ -274,6 +275,7 @@ def persistent_all_gather_partitioned(
                 target_rank,
                 heap_bases,
                 mask=combined_mask,
+                hint=(1, BLOCK_SIZE_N),
             )
 
 
