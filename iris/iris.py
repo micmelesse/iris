@@ -45,6 +45,7 @@ from triton.language.core import _aggregate as aggregate
 from iris._distributed_helpers import (
     init_distributed,
     distributed_barrier,
+    distributed_device_barrier,
     distributed_broadcast_scalar,
     distributed_broadcast_tensor,
 )
@@ -55,6 +56,7 @@ from iris.hip import (
 )
 from iris.symmetric_heap import SymmetricHeap
 import numpy as np
+from typing import Any
 import torch
 import logging
 
@@ -134,6 +136,9 @@ class Iris:
 
         # Lazy initialization for ops interface
         self._ops = None
+
+        # Device-side barrier state, keyed by process group (None = all ranks).
+        self._device_barrier_state: dict[Any, torch.Tensor] = {}
 
         # Initialize tracing
         self.tracing = Tracing(self)
@@ -988,6 +993,34 @@ class Iris:
 
         # Distributed barrier
         distributed_barrier(group=group)
+
+    def device_barrier(self, group=None):
+        """
+        Stateless device-side barrier that is CUDA graph capturable.
+
+        Unlike ``barrier()`` which uses host-side ``torch.distributed.barrier()``,
+        this uses device-side atomic operations on the symmetric heap to synchronize
+        ranks. No CPU-side epoch tracking -- each rank's flag on the heap serves
+        as its own epoch counter, managed entirely by the GPU via atomic_add.
+
+        Args:
+            group (ProcessGroup, optional): The process group to synchronize.
+                If None, uses all ranks in the shmem context.
+
+        Example:
+            >>> ctx = iris.iris(1 << 20)
+            >>> ctx.device_barrier()  # Synchronize all ranks on device
+        """
+        if group not in self._device_barrier_state:
+            self._device_barrier_state[group] = self.zeros((self.num_ranks,), dtype=torch.int32)
+
+        distributed_device_barrier(
+            self._device_barrier_state[group],
+            group,
+            self.cur_rank,
+            self.num_ranks,
+            self.get_heap_bases(),
+        )
 
     def get_device(self):
         """
