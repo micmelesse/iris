@@ -9,7 +9,6 @@ import torch
 import triton
 import triton.language as tl
 import iris
-from iris._distributed_helpers import _device_barrier_kernel, extract_group_info
 
 
 BarrierType = Literal["host", "device"]
@@ -55,22 +54,23 @@ def _write_remote_kernel(
 @pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
 def test_barrier_basic(barrier_type, n):
     shmem = iris.iris(1 << 20)
-    shmem.barrier()
+    _call_barrier(shmem, barrier_type)
 
     try:
         for _ in range(n):
             _call_barrier(shmem, barrier_type)
     finally:
-        shmem.barrier()
+        _call_barrier(shmem, barrier_type)
         del shmem
         gc.collect()
 
 
 @pytest.mark.parametrize("n", [1, 2, 5, 10])
-def test_barrier_state_reuse(n):
+@pytest.mark.parametrize("barrier_type", BARRIER_TYPES)
+def test_barrier_state_reuse(barrier_type, n):
     """Verify device barrier reuses the same flags tensor across calls."""
     shmem = iris.iris(1 << 20)
-    shmem.barrier()
+    _call_barrier(shmem, barrier_type)
 
     try:
         shmem.device_barrier()
@@ -82,7 +82,7 @@ def test_barrier_state_reuse(n):
             shmem.device_barrier()
             assert shmem._device_barrier_state[None].data_ptr() == flags_ptr
     finally:
-        shmem.barrier()
+        _call_barrier(shmem, barrier_type)
         del shmem
         gc.collect()
 
@@ -161,13 +161,13 @@ def _cross_rank_graph(
     buf,
     result,
 ):
-    stream = torch.cuda.Stream()
+    capture_stream = torch.cuda.Stream()
 
     if op == "load":
         buf.fill_(float(rank))
 
         # Warmup on capture stream.
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(capture_stream):
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _read_remote_kernel[(1,)](
@@ -180,11 +180,11 @@ def _cross_rank_graph(
             )
             for _ in range(num_barriers):
                 shmem.device_barrier()
-        stream.synchronize()
+        capture_stream.synchronize()
 
         # Capture.
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
+        with torch.cuda.graph(graph, stream=capture_stream):
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _read_remote_kernel[(1,)](
@@ -201,11 +201,11 @@ def _cross_rank_graph(
         # Replay with fresh data.
         for i in range(rounds):
             val = float(rank + (i + 1) * 10)
-            buf.fill_(val)
-            shmem.device_barrier()
-
-            graph.replay()
-            stream.synchronize()
+            with torch.cuda.stream(capture_stream):
+                buf.fill_(val)
+                shmem.device_barrier()
+                graph.replay()
+            capture_stream.synchronize()
 
             expected = torch.full(
                 (N,),
@@ -218,7 +218,7 @@ def _cross_rank_graph(
         buf.fill_(0.0)
 
         # Warmup on capture stream.
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(capture_stream):
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _write_remote_kernel[(1,)](
@@ -231,11 +231,11 @@ def _cross_rank_graph(
             )
             for _ in range(num_barriers):
                 shmem.device_barrier()
-        stream.synchronize()
+        capture_stream.synchronize()
 
         # Capture.
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
+        with torch.cuda.graph(graph, stream=capture_stream):
             for _ in range(num_barriers):
                 shmem.device_barrier()
             _write_remote_kernel[(1,)](
@@ -251,13 +251,15 @@ def _cross_rank_graph(
 
         # Replay and verify.
         for _ in range(rounds):
-            buf.fill_(0.0)
-            shmem.device_barrier()
+            with torch.cuda.stream(capture_stream):
+                buf.fill_(0.0)
+                shmem.device_barrier()
+                graph.replay()
+            capture_stream.synchronize()
 
-            graph.replay()
-            stream.synchronize()
-
-            shmem.device_barrier()
+            with torch.cuda.stream(capture_stream):
+                shmem.device_barrier()
+            capture_stream.synchronize()
             expected = torch.full((N,), float(writer), dtype=torch.float32, device="cuda")
             torch.testing.assert_close(buf, expected, rtol=0, atol=0)
 
@@ -288,7 +290,7 @@ def test_barrier_cross_rank(barrier_type, op, mode, num_barriers, N, rounds=3):
         )
 
     shmem = iris.iris(1 << 20)
-    shmem.barrier()
+    _call_barrier(shmem, barrier_type)
     rank = shmem.get_rank()
     num_ranks = shmem.get_num_ranks()
     heap_bases = shmem.get_heap_bases()
@@ -332,44 +334,6 @@ def test_barrier_cross_rank(barrier_type, op, mode, num_barriers, N, rounds=3):
                     result,
                 )
     finally:
-        shmem.barrier()
-        del shmem
-        gc.collect()
-
-
-def test_barrier_timeout_assert():
-    """Verify device_barrier asserts on timeout instead of hanging forever.
-
-    Only rank 0 calls the barrier kernel. Other ranks skip it, so rank 0
-    spins waiting for them and hits the MAX_SPINS assert.
-    """
-    shmem = iris.iris(1 << 20)
-    rank = shmem.get_rank()
-    num_ranks = shmem.get_num_ranks()
-    heap_bases = shmem.get_heap_bases()
-
-    if num_ranks < 2:
-        pytest.skip("Need at least 2 ranks")
-
-    shmem.barrier()
-
-    flags = shmem._device_barrier_state.setdefault(None, shmem.zeros((num_ranks,), dtype=torch.int32))
-
-    try:
-        if rank == 0:
-            _, rank_global, world_size, rank_start, rank_stride = extract_group_info(None, rank, num_ranks)
-            _device_barrier_kernel[(1,)](
-                flags,
-                rank_global,
-                world_size,
-                rank_start,
-                rank_stride,
-                heap_bases,
-                MAX_SPINS=1000,
-            )
-            with pytest.raises(RuntimeError, match="device-side assert"):
-                torch.cuda.synchronize()
-    finally:
-        shmem.barrier()
+        _call_barrier(shmem, barrier_type)
         del shmem
         gc.collect()

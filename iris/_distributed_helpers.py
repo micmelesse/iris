@@ -248,12 +248,11 @@ def extract_group_info(group, rank, num_ranks):
 
     group_ranks = dist.get_process_group_ranks(group)
     world_size = len(group_ranks)
-    rank_global = dist.get_rank()
+    rank_global = rank
 
     if rank_global not in group_ranks:
         raise RuntimeError(
-            f"Current rank {rank_global} is not part of the specified process group. "
-            f"Group contains ranks: {group_ranks}"
+            f"Rank {rank_global} is not part of the specified process group. Group contains ranks: {group_ranks}"
         )
 
     rank_in_group = group_ranks.index(rank_global)
@@ -315,16 +314,17 @@ def _device_barrier_kernel(
     MAX_SPINS: tl.constexpr = 1_000_000_000,
 ):
     """
-    Stateless device-side barrier using atomic operations on the symmetric heap.
+    Device-side barrier using atomic operations on the symmetric heap.
+    CUDA graph capturable.
+
+    Stateless w.r.t. host-side epoch tracking: there is no CPU-side epoch
+    counter. Each rank's flag on the heap serves as its own epoch counter,
+    managed entirely by the GPU via atomic_add. A persistent per-group flags
+    tensor is cached in ``_device_barrier_state``.
 
     Launched with grid=(1,). A single CTA:
     1. Atomically increments its own flag (atomic_add, release)
     2. Serially polls each remote rank's flag for the same value (acquire)
-
-    No CPU-side epoch tracking. Each rank's flag IS the epoch, managed
-    entirely on the GPU via atomic_add. This makes the barrier safe for
-    CUDA graph capture: during recording the kernel is just recorded,
-    during replay all ranks increment together.
     """
     # Increment own flag and determine target
     own_flag_ptr = flags_ptr + iris_rank
@@ -355,15 +355,17 @@ def _device_barrier_kernel(
 
 def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
     """
-    Stateless device-side barrier using atomic operations on the symmetric heap.
+    Device-side barrier using atomic operations on the symmetric heap.
+    CUDA graph capturable.
 
     Unlike ``distributed_barrier`` which uses host-side ``torch.distributed.barrier()``,
     this launches a single-CTA Triton kernel that synchronizes via
     device-side atomics, making it safe to use during CUDA graph capture.
 
-    No CPU-side epoch tracking is needed. Each rank's flag on the symmetric
-    heap serves as its own epoch counter, managed entirely by the GPU via
-    atomic_add.
+    Stateless w.r.t. host-side epoch tracking: each rank's flag on the
+    symmetric heap serves as its own epoch counter, managed entirely by
+    the GPU via atomic_add. A persistent per-group flags tensor is cached
+    in ``_device_barrier_state``.
 
     Args:
         flags: int32 tensor on symmetric heap, one element per rank.

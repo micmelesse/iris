@@ -996,12 +996,14 @@ class Iris:
 
     def device_barrier(self, group=None):
         """
-        Stateless device-side barrier that is CUDA graph capturable.
+        Device-side barrier that is CUDA graph capturable.
 
         Unlike ``barrier()`` which uses host-side ``torch.distributed.barrier()``,
         this uses device-side atomic operations on the symmetric heap to synchronize
-        ranks. No CPU-side epoch tracking -- each rank's flag on the heap serves
-        as its own epoch counter, managed entirely by the GPU via atomic_add.
+        ranks. Stateless w.r.t. host-side epoch tracking: each rank's flag on
+        the heap serves as its own epoch counter, managed entirely by the GPU
+        via atomic_add. A persistent per-group flags tensor is cached in
+        ``_device_barrier_state``.
 
         Args:
             group (ProcessGroup, optional): The process group to synchronize.
