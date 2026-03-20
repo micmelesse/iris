@@ -2445,7 +2445,7 @@ def atomic_max(
     return tl.atomic_max(translated_ptr, val, mask=mask, sem=sem, scope=scope)
 
 
-def iris(heap_size=1 << 30, allocator_type="torch"):
+def iris(heap_size=1 << 30, allocator_type="torch", coord_backend="nccl"):
     """
     Create and return an Iris instance with the specified heap size.
 
@@ -2453,6 +2453,8 @@ def iris(heap_size=1 << 30, allocator_type="torch"):
         heap_size (int): Size of the heap in bytes. Defaults to 1GB.
         allocator_type (str): Type of allocator to use. Options: "torch" (default), "vmem".
                               Can be overridden with IRIS_ALLOCATOR environment variable.
+        coord_backend (str): Backend for init-time coordination. "gloo" avoids NCCL
+                             watchdog issues during CUDA graph capture. Default: "nccl".
 
     Returns:
         Iris: An initialized Iris instance.
@@ -2466,4 +2468,4 @@ def iris(heap_size=1 << 30, allocator_type="torch"):
         >>> iris_ctx = iris.iris(2**30, allocator_type="vmem")
         >>> tensor = iris_ctx.zeros(1024, 1024)
     """
-    return Iris(heap_size, allocator_type)
+    return Iris(heap_size, allocator_type, coord_backend)
