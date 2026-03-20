@@ -58,6 +58,7 @@ from iris.symmetric_heap import SymmetricHeap
 import numpy as np
 from typing import Any
 import torch
+import torch.distributed as dist
 import logging
 
 # Import logging functionality from the separate logging module
@@ -91,7 +92,7 @@ class Iris:
         >>> ctx = iris.iris(heap_size=2**31, allocator_type="vmem")
     """
 
-    def __init__(self, heap_size=1 << 30, allocator_type="torch"):
+    def __init__(self, heap_size=1 << 30, allocator_type="torch", coord_backend="nccl"):
         if is_simulation_env():
             allocator_type = "torch"
 
@@ -108,8 +109,25 @@ class Iris:
         self.gpu_id = gpu_id
         self.heap_size = heap_size
 
+        # Coordination group for init-time collective ops (allgather, barrier)
+        # and runtime barrier choice (device_barrier vs host barrier).
+        #
+        # "gloo": CPU-only backend with no watchdog thread. Prevents the
+        #   ProcessGroupNCCL watchdog from accumulating work items that crash
+        #   with hipErrorCapturedEvent during CUDA graph capture on ROCm.
+        #   Runtime CCL barriers use device_barrier (GPU-side atomics).
+        #
+        # "nccl": Default PG. Runtime CCL barriers use host-side barrier.
+        if coord_backend == "gloo":
+            self._coord_group = dist.new_group(backend="gloo")
+            self.use_device_barrier = True
+        else:
+            self._coord_group = dist.group.WORLD
+            self.use_device_barrier = False
+
         # Initialize symmetric heap with specified allocator
-        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type)
+        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type,
+                                  coord_group=self._coord_group)
         self.device = f"cuda:{gpu_id}"
         self.heap_bases = self.heap.get_heap_bases()
 
@@ -129,7 +147,7 @@ class Iris:
                     indent=2,
                 )
 
-        distributed_barrier()
+        distributed_barrier(group=self._coord_group)
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
@@ -318,12 +336,12 @@ class Iris:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = distributed_broadcast_scalar(is_tensor, source_rank)
+        is_tensor = distributed_broadcast_scalar(is_tensor, source_rank, group=self._coord_group)
 
         if is_tensor:
-            return distributed_broadcast_tensor(value, root=source_rank)
+            return distributed_broadcast_tensor(value, root=source_rank, group=self._coord_group)
         else:
-            return distributed_broadcast_scalar(value, source_rank)
+            return distributed_broadcast_scalar(value, source_rank, group=self._coord_group)
 
     def zeros_like(
         self, input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format

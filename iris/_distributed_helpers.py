@@ -9,18 +9,6 @@ import triton
 import triton.language as tl
 
 
-def _infer_device():
-    if not dist.is_initialized():
-        raise RuntimeError("PyTorch distributed is not initialized")
-    try:
-        backend = str(dist.get_backend()).lower()
-    except Exception:
-        backend = "gloo"
-    if backend == "nccl" and torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
-
-
 def _nccl_dtype_supported(t: torch.Tensor) -> bool:
     """Conservative whitelist for NCCL tensor dtypes."""
     supported = {
@@ -32,18 +20,21 @@ def _nccl_dtype_supported(t: torch.Tensor) -> bool:
         torch.float32,
         torch.float64,
     }
-    # bfloat16 is commonly supported in recent stacks; include if available
     if hasattr(torch, "bfloat16"):
         supported.add(torch.bfloat16)
     return t.dtype in supported
 
 
-def distributed_allgather(data):
+def distributed_allgather(data, group):
     """
     All-gather operation using PyTorch distributed.
 
+    The backend is inferred from the group. Pass a gloo group to avoid
+    creating NCCL work items on the default PG.
+
     Args:
         data: 1D numpy array to gather across all ranks
+        group: Process group to use.
 
     Returns:
         2D numpy array with shape (world_size, len(data))
@@ -54,65 +45,69 @@ def distributed_allgather(data):
     data = np.asarray(data)
     assert data.ndim == 1, "Only 1D arrays are supported."
 
-    world_size = dist.get_world_size()
-    device = _infer_device()
-    backend = str(dist.get_backend()).lower()
-
-    # Fast path: tensor all_gather if dtype is NCCL-supported or backend != nccl
+    world_size = dist.get_world_size(group)
+    backend = dist.get_backend(group)
     data_tensor = torch.from_numpy(data)
-    # Gloo doesn't support uint64, so use object collective for uint64 with gloo
-    # For int64 with gloo, we can use tensor collective (gloo supports int64)
-    use_tensor_collective = (backend != "nccl" or _nccl_dtype_supported(data_tensor)) and not (
-        backend == "gloo" and data_tensor.dtype == torch.uint64
-    )
 
-    if use_tensor_collective:
-        data_tensor = data_tensor.to(device)
-        gathered_tensors = [torch.empty_like(data_tensor) for _ in range(world_size)]
-        dist.all_gather(gathered_tensors, data_tensor)
-        stacked = torch.stack(gathered_tensors, dim=0)
-        cpu_tensor = stacked.to("cpu")
-        result = cpu_tensor.numpy()
-        return result
-    else:
-        # Fallback for NCCL-unsupported dtypes or gloo with uint64 (e.g., uint64/bool/etc.)
+    if backend == "gloo":
+        # Gloo: CPU tensors, no uint64 support
+        if data_tensor.dtype == torch.uint64:
+            obj_list = [None for _ in range(world_size)]
+            dist.all_gather_object(obj_list, data, group=group)
+            return np.stack(obj_list, axis=0)
+        gathered = [torch.empty_like(data_tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, data_tensor, group=group)
+        return torch.stack(gathered, dim=0).numpy()
+
+    # NCCL path: GPU tensors
+    if not _nccl_dtype_supported(data_tensor):
         obj_list = [None for _ in range(world_size)]
-        # Use object collective (works across backends)
-        dist.all_gather_object(obj_list, data)
-        # Ensure uniform shapes and stack
-        result = np.stack(obj_list, axis=0)
-        return result
+        dist.all_gather_object(obj_list, data, group=group)
+        return np.stack(obj_list, axis=0)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    data_tensor = data_tensor.to(device)
+    gathered = [torch.empty_like(data_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, data_tensor, group=group)
+    return torch.stack(gathered, dim=0).cpu().numpy()
 
 
-def distributed_allgather_multidim(data):
+def distributed_allgather_multidim(data, group):
     """
     All-gather operation for multi-dimensional tensors using PyTorch distributed.
+
+    Args:
+        data: Multi-dimensional tensor/array to gather across all ranks
+        group: Process group to use.
     """
     if not dist.is_initialized():
         raise RuntimeError("PyTorch distributed is not initialized")
 
-    world_size = dist.get_world_size()
-    device = _infer_device()
+    world_size = dist.get_world_size(group)
+    backend = dist.get_backend(group)
 
-    input_tensor = torch.as_tensor(data).to(device)
+    input_tensor = torch.as_tensor(data)
+    if backend == "gloo" and input_tensor.is_cuda:
+        input_tensor = input_tensor.cpu()
+    elif backend != "gloo":
+        device = torch.device("cuda", torch.cuda.current_device())
+        input_tensor = input_tensor.to(device)
 
     tensor_list = [torch.empty_like(input_tensor) for _ in range(world_size)]
+    dist.all_gather(tensor_list, input_tensor, group=group)
 
-    dist.all_gather(tensor_list, input_tensor)
-
-    stacked_tensor = torch.stack(tensor_list, dim=0)
-    reshaped_tensor = stacked_tensor.view(world_size, -1)
-
-    return reshaped_tensor.cpu().numpy()
+    stacked = torch.stack(tensor_list, dim=0).view(world_size, -1)
+    return stacked.cpu().numpy() if stacked.is_cuda else stacked.numpy()
 
 
-def distributed_broadcast_scalar(value=None, root=0):
+def distributed_broadcast_scalar(value, root, group=None):
     """
     Broadcast a scalar value from root to all ranks.
 
     Args:
         value: Value to broadcast (only used on root rank)
         root: Root rank to broadcast from
+        group: Process group to use.
 
     Returns:
         Broadcasted value
@@ -120,55 +115,56 @@ def distributed_broadcast_scalar(value=None, root=0):
     if not dist.is_initialized():
         raise RuntimeError("PyTorch distributed is not initialized")
 
-    rank = dist.get_rank()
-    device = _infer_device()
-    backend = str(dist.get_backend()).lower()
+    rank = dist.get_rank(group) if group is not None else dist.get_rank()
+    backend = dist.get_backend(group)
 
-    # First agree on dtype (numpy dtype object)
     if rank == root:
         if value is None:
             raise ValueError("Root must provide a value.")
-        np_val = np.array(value)  # captures dtype
+        np_val = np.array(value)
         dtype = np_val.dtype
     else:
         np_val = None
         dtype = None
 
     dtype_obj = [dtype]
-    dist.broadcast_object_list(dtype_obj, src=root)
+    dist.broadcast_object_list(dtype_obj, src=root, group=group)
     dtype = dtype_obj[0]
 
-    # If NCCL can't handle this dtype, just broadcast the object directly.
     if backend == "nccl":
-        # Try a quick check using a tiny tensor of the dtype
         try:
             torch_dtype = torch.from_numpy(np.array(0, dtype=dtype)).dtype
             dummy = torch.empty((), dtype=torch_dtype)
             if not _nccl_dtype_supported(dummy):
                 obj = [value if rank == root else None]
-                dist.broadcast_object_list(obj, src=root)
+                dist.broadcast_object_list(obj, src=root, group=group)
                 return obj[0]
         except (TypeError, ValueError):
-            # Dtype not supported by torch (e.g., str, object), use object broadcast
             obj = [value if rank == root else None]
-            dist.broadcast_object_list(obj, src=root)
+            dist.broadcast_object_list(obj, src=root, group=group)
             return obj[0]
 
-    # Tensor path: create a 0-D tensor, broadcast on the selected device
     if rank != root:
         np_val = np.empty((), dtype=dtype)
-    val_t = torch.from_numpy(np_val).to(device)
-    dist.broadcast(val_t, src=root)
-    return val_t.to("cpu").item()
+
+    if backend == "gloo":
+        val_t = torch.from_numpy(np_val)
+    else:
+        device = torch.device("cuda", torch.cuda.current_device())
+        val_t = torch.from_numpy(np_val).to(device)
+
+    dist.broadcast(val_t, src=root, group=group)
+    return val_t.cpu().item() if val_t.is_cuda else val_t.item()
 
 
-def distributed_broadcast_tensor(value_to_broadcast=None, root=0):
+def distributed_broadcast_tensor(value_to_broadcast, root, group=None):
     """
     Broadcast a tensor/array from root to all ranks.
 
     Args:
         value_to_broadcast: Tensor or array to broadcast (only used on root rank)
         root: Root rank to broadcast from
+        group: Process group to use.
 
     Returns:
         Broadcasted numpy array
@@ -176,9 +172,8 @@ def distributed_broadcast_tensor(value_to_broadcast=None, root=0):
     if not dist.is_initialized():
         raise RuntimeError("PyTorch distributed is not initialized")
 
-    rank = dist.get_rank()
-    device = _infer_device()
-    backend = str(dist.get_backend()).lower()
+    rank = dist.get_rank(group) if group is not None else dist.get_rank()
+    backend = dist.get_backend(group)
 
     if rank == root:
         if value_to_broadcast is None:
@@ -189,25 +184,26 @@ def distributed_broadcast_tensor(value_to_broadcast=None, root=0):
         metadata = [None, None]
         tensor = None
 
-    dist.broadcast_object_list(metadata, src=root)
+    dist.broadcast_object_list(metadata, src=root, group=group)
     shape, dtype = metadata
 
     if rank != root:
         tensor = torch.empty(shape, dtype=dtype)
 
-    use_tensor_collective = backend != "nccl" or _nccl_dtype_supported(tensor)
-
-    if use_tensor_collective:
-        tensor = tensor.to(device)
-        dist.broadcast(tensor, src=root)
-        return tensor.to("cpu").numpy()
-    else:
+    if backend == "nccl" and not _nccl_dtype_supported(tensor):
         if rank == root:
             obj = [np.asarray(value_to_broadcast)]
         else:
             obj = [None]
-        dist.broadcast_object_list(obj, src=root)
+        dist.broadcast_object_list(obj, src=root, group=group)
         return obj[0]
+
+    if backend != "gloo":
+        device = torch.device("cuda", torch.cuda.current_device())
+        tensor = tensor.to(device)
+
+    dist.broadcast(tensor, src=root, group=group)
+    return tensor.cpu().numpy() if tensor.is_cuda else tensor.numpy()
 
 
 def extract_group_info(group, rank, num_ranks):
@@ -280,13 +276,13 @@ def extract_group_info(group, rank, num_ranks):
     return rank_in_group, rank_global, world_size, rank_start, rank_stride
 
 
-def distributed_barrier(group=None):
+def distributed_barrier(group):
     """
     Synchronization barrier using PyTorch distributed.
 
     Args:
         group (ProcessGroup, optional): The process group to synchronize.
-            If None, uses the default process group (all ranks).
+            If None, uses the default process group.
     """
     if not dist.is_initialized():
         raise RuntimeError("PyTorch distributed is not initialized")
