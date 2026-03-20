@@ -84,7 +84,7 @@ def all_reduce_preamble(
     workspace.num_rings = getattr(config, "all_reduce_num_rings", 1)
     workspace.prepared = False
 
-    barrier_fn = shmem.device_barrier if config.use_device_barrier else shmem.barrier
+    barrier_fn = shmem.device_barrier if config.graph_capturable else shmem.barrier
 
     if variant in (VARIANT_ATOMIC, VARIANT_SPINLOCK, VARIANT_ONE_SHOT):
         output_tensor.zero_()
@@ -969,7 +969,7 @@ def all_reduce(
         workspace.prepared = False
 
     if not async_op:
-        barrier_fn = shmem.device_barrier if config.use_device_barrier else shmem.barrier
+        barrier_fn = shmem.device_barrier if config.graph_capturable else shmem.barrier
         barrier_fn()
 
     return workspace

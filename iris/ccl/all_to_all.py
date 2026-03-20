@@ -431,5 +431,5 @@ def all_to_all(
         )
 
     if not async_op:
-        barrier_fn = shmem.device_barrier if config.use_device_barrier else shmem.barrier
+        barrier_fn = shmem.device_barrier if config.graph_capturable else shmem.barrier
         barrier_fn()

@@ -44,8 +44,8 @@ class Config:
                                  (default: auto-set to block_size_n // world_size at runtime)
         reduce_scatter_variant: Variant for reduce-scatter operation (default: "two_shot")
                                 Only "two_shot" is supported
-        use_device_barrier: If True, use device-side barrier (CUDA graph capturable)
-                           instead of host-side barrier (NCCL-based). Default: False.
+        graph_capturable: If True, use device-side barrier (CUDA graph capturable)
+                         instead of host-side barrier (NCCL-based). Default: False.
 
     Example:
         >>> import iris
@@ -82,7 +82,7 @@ class Config:
     all_reduce_num_rings: int = 1
     all_reduce_ring_slice_n: int | None = None
     reduce_scatter_variant: str = "two_shot"
-    use_device_barrier: bool = False
+    graph_capturable: bool = False
 
     def __post_init__(self):
         """Validate and auto-detect num_xcds if not set."""
