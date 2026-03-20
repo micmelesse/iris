@@ -25,7 +25,7 @@ def _nccl_dtype_supported(t: torch.Tensor) -> bool:
     return t.dtype in supported
 
 
-def distributed_allgather(data, group):
+def distributed_allgather(data, group=None):
     """
     All-gather operation using PyTorch distributed.
 
@@ -72,7 +72,7 @@ def distributed_allgather(data, group):
     return torch.stack(gathered, dim=0).cpu().numpy()
 
 
-def distributed_allgather_multidim(data, group):
+def distributed_allgather_multidim(data, group=None):
     """
     All-gather operation for multi-dimensional tensors using PyTorch distributed.
 
@@ -276,7 +276,7 @@ def extract_group_info(group, rank, num_ranks):
     return rank_in_group, rank_global, world_size, rank_start, rank_stride
 
 
-def distributed_barrier(group):
+def distributed_barrier(group=None):
     """
     Synchronization barrier using PyTorch distributed.
 
