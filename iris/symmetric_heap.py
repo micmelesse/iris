@@ -177,7 +177,9 @@ class SymmetricHeap:
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
         local_base_arr = np.array([my_base], dtype=np.int64)
-        all_bases_arr = distributed_allgather(local_base_arr, group=self._coord_group).reshape(self.num_ranks).astype(np.int64)
+        all_bases_arr = (
+            distributed_allgather(local_base_arr, group=self._coord_group).reshape(self.num_ranks).astype(np.int64)
+        )
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
         if self.num_ranks == 1 or self.fd_conns is None:

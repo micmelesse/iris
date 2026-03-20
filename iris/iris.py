@@ -126,8 +126,7 @@ class Iris:
             self.use_device_barrier = False
 
         # Initialize symmetric heap with specified allocator
-        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type,
-                                  coord_group=self._coord_group)
+        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type, coord_group=self._coord_group)
         self.device = f"cuda:{gpu_id}"
         self.heap_bases = self.heap.get_heap_bases()
 
