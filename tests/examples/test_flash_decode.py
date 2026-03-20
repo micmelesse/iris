@@ -169,10 +169,10 @@ def test_correctness_fused_full(kv_len, num_heads, num_seqs, head_dim):
         ].contiguous()
 
         block_tables_this_rank = torch.arange(NUM_BLOCKS_PER_RANK, dtype=torch.int32).repeat(num_seqs, 1)
-        all_block_tables_numpy = iris._distributed_helpers.distributed_allgather_multidim(
-            block_tables_this_rank.cpu().numpy()
-        )
-        block_tables = torch.from_numpy(all_block_tables_numpy).view(args.num_ranks, num_seqs, -1)
+        input_tensor = block_tables_this_rank.cuda()
+        gathered = shmem.dist.all_gather(input_tensor)
+        all_block_tables = torch.stack(gathered).view(args.num_ranks, -1)
+        block_tables = all_block_tables.view(args.num_ranks, num_seqs, -1)
         ref_block_tables = torch.cat([block_tables[i] + i * NUM_BLOCKS_PER_RANK for i in range(args.num_ranks)], dim=-1)
 
         common_params = {

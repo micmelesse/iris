@@ -93,7 +93,7 @@ add_module_names = False
 autodoc_mock_imports = [
     "torch",
     "numpy",
-    "iris._distributed_helpers",
+    "iris.dist_backend",
     "iris.hip",
     "tritonblas",
 ]

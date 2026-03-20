@@ -39,12 +39,7 @@ except ImportError as e:
 
 import triton.language as tl
 
-from iris._distributed_helpers import (
-    init_distributed,
-    distributed_barrier,
-    distributed_broadcast_scalar,
-    distributed_broadcast_tensor,
-)
+from iris.dist_backend import NCCLBackend
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -801,14 +796,15 @@ class IrisGluon:
     """
 
     def __init__(self, heap_size=1 << 30):
-        # Initialize distributed environment
-        comm, cur_rank, num_ranks = init_distributed()
-        num_gpus = count_devices()
+        # Distributed backend for all external collective ops.
+        self.dist = NCCLBackend()
 
+        num_gpus = count_devices()
+        cur_rank = self.dist.rank
+        num_ranks = self.dist.world_size
         gpu_id = cur_rank % num_gpus
         set_device(gpu_id)
 
-        self.comm = comm
         self.num_ranks = num_ranks
         self.cur_rank = cur_rank
         self.gpu_id = gpu_id
@@ -816,13 +812,13 @@ class IrisGluon:
         self.device = f"cuda:{gpu_id}"
 
         # Initialize symmetric heap
-        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks)
+        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, dist_backend=self.dist)
         self.heap_bases = self.heap.get_heap_bases()
 
         for i in range(num_ranks):
             self.debug(f"GPU {i}: Heap base {hex(int(self.heap_bases[i].item()))}")
 
-        distributed_barrier()
+        self.dist.host_barrier()
 
         # Initialize tracing manager (disabled by default)
         self.tracing = Tracing(self)
@@ -1072,7 +1068,7 @@ class IrisGluon:
             group (ProcessGroup, optional): The process group to synchronize.
                 If None, uses the default process group (all ranks).
         """
-        distributed_barrier(group=group)
+        self.dist.host_barrier()
 
     def get_device(self):
         """
@@ -1153,12 +1149,13 @@ class IrisGluon:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = distributed_broadcast_scalar(is_tensor, src_rank)
+        is_tensor = self.dist.broadcast(is_tensor, src_rank)
 
         if is_tensor:
-            return distributed_broadcast_tensor(data, root=src_rank)
+            arr = np.asarray(data) if self.cur_rank == src_rank else None
+            return self.dist.broadcast(arr, src_rank)
         else:
-            return distributed_broadcast_scalar(data, src_rank)
+            return self.dist.broadcast(data if self.cur_rank == src_rank else None, src_rank)
 
     def zeros(
         self,

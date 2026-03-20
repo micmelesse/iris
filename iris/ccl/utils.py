@@ -9,7 +9,6 @@ from enum import IntEnum
 from typing import Tuple
 import triton
 import triton.language as tl
-from iris._distributed_helpers import extract_group_info as _extract_group_info
 
 
 @triton.jit()
@@ -75,4 +74,4 @@ def extract_group_info(group, shmem) -> Tuple[int, int, int, int, int]:
         - rank_stride: Stride between consecutive ranks in the group
     """
 
-    return _extract_group_info(group, shmem.get_rank(), shmem.get_num_ranks())
+    return shmem.dist.extract_group_info(group)
