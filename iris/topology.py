@@ -13,7 +13,7 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-import torch.distributed as dist
+from iris.dist_backend import NCCLBackend
 
 logger = logging.getLogger("iris.topology")
 
@@ -1041,40 +1041,6 @@ def _parse_amd_topo(local_pci_bus_ids: List[str]) -> Optional[List[List[int]]]:
         return None
 
 
-def _all_gather_strings(local_string: str, world_size: int) -> List[str]:
-    """
-    All-gather a string from each rank using PyTorch distributed.
-
-    Compatible with Iris's use of torch.distributed (NCCL/RCCL backend).
-    """
-    local_bytes = local_string.encode("utf-8")
-    local_len = len(local_bytes)
-
-    # All-gather lengths
-    len_tensor = torch.tensor([local_len], dtype=torch.long, device="cuda")
-    len_list = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(world_size)]
-    dist.all_gather(len_list, len_tensor)
-    max_len = max(t.item() for t in len_list)
-
-    if max_len == 0:
-        return [""] * world_size
-
-    # All-gather padded byte tensors
-    # Use frombuffer to avoid iterating every byte through Python space.
-    # bytearray is required because frombuffer needs a writable buffer,
-    # and copy=True ensures NCCL gets an owned contiguous CUDA tensor.
-    padded = bytearray(local_bytes) + bytearray(max_len - local_len)
-    local_tensor = torch.frombuffer(padded, dtype=torch.uint8).to("cuda", copy=True)
-    gathered = [torch.zeros(max_len, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
-    dist.all_gather(gathered, local_tensor)
-
-    results = []
-    for t, length_t in zip(gathered, len_list):
-        length = int(length_t.item())
-        results.append(bytes(t[:length].cpu().tolist()).decode("utf-8"))
-    return results
-
-
 class TopologyDiscovery:
     """
     Multi-node multi-GPU topology discovery for Iris.
@@ -1096,6 +1062,7 @@ class TopologyDiscovery:
             self.rank = iris_ctx.cur_rank
             self.world_size = iris_ctx.num_ranks
             self.gpu_id = iris_ctx.gpu_id
+            self._dist = iris_ctx.dist
         else:
             num_gpus = torch.cuda.device_count()
             if num_gpus <= 0:
@@ -1112,11 +1079,9 @@ class TopologyDiscovery:
             # device assigned to this process, otherwise all ranks fight over
             # GPU 0 and init either fails or produces world_size=1.
             torch.cuda.set_device(self.gpu_id)
-            if dist.is_initialized():
-                self.rank = dist.get_rank()
-                self.world_size = dist.get_world_size()
-            else:
-                raise RuntimeError("TopologyDiscovery requires an initialized distributed process group.")
+            self._dist = NCCLBackend()
+            self.rank = self._dist.rank
+            self.world_size = self._dist.world_size
 
     @property
     def topology(self) -> Optional[TopologyMap]:
@@ -1193,7 +1158,7 @@ class TopologyDiscovery:
 
         # All-gather
         local_gpu_json = json.dumps(local_gpu_info.to_dict())
-        all_gpu_jsons = _all_gather_strings(local_gpu_json, self.world_size)
+        all_gpu_jsons = self._dist.all_gather(local_gpu_json)
 
         node_info_json = json.dumps(
             {
@@ -1204,7 +1169,7 @@ class TopologyDiscovery:
                 "num_visible_gpus": num_local_gpus,
             }
         )
-        all_node_jsons = _all_gather_strings(node_info_json, self.world_size)
+        all_node_jsons = self._dist.all_gather(node_info_json)
 
         # Build global topology
         gpu_info_map: Dict[int, GPUInfo] = {}

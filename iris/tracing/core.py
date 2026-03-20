@@ -188,8 +188,6 @@ class Tracing:
         Returns:
             dict: Trace data (merged on rank 0 if merge=True, per-rank otherwise)
         """
-        import torch.distributed as dist
-
         if not self.enabled:
             self.iris.warning("Tracing not enabled. Call tracing.enable() first.")
             return {}
@@ -251,11 +249,10 @@ class Tracing:
 
         # Gather event counts to rank 0
         event_counts = torch.tensor([len(events_bytes)], dtype=torch.int64, device="cuda")
-        all_event_counts = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(self.iris.num_ranks)]
-        dist.all_gather(all_event_counts, event_counts)
+        all_event_counts = self.iris.dist.all_gather(event_counts)
 
         # Synchronize before point-to-point communication to ensure proper ordering
-        dist.barrier()
+        self.iris.dist.host_barrier()
 
         # Rank 0: gather and merge all events
         if self.iris.cur_rank == 0:
@@ -267,7 +264,7 @@ class Tracing:
                 else:
                     recv_size = all_event_counts[rank_id].item()
                     recv_tensor = torch.zeros(recv_size, dtype=torch.uint8, device="cuda")
-                    dist.recv(recv_tensor, src=rank_id)
+                    self.iris.dist.recv(recv_tensor, src=rank_id)
                     recv_bytes = bytes(recv_tensor.cpu().numpy())
                     rank_events = pickle.loads(recv_bytes)
                     all_events.extend(rank_events)
@@ -326,5 +323,5 @@ class Tracing:
             return merged_data
         else:
             # Other ranks: send events to rank 0
-            dist.send(events_tensor, dst=0)
+            self.iris.dist.send(events_tensor, dst=0)
             return {}

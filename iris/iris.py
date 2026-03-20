@@ -43,13 +43,8 @@ import triton
 import triton.language as tl
 from triton.language.core import _aggregate as aggregate
 
-from iris._distributed_helpers import (
-    init_distributed,
-    distributed_barrier,
-    distributed_device_barrier,
-    distributed_broadcast_scalar,
-    distributed_broadcast_tensor,
-)
+from iris.dist_backend import NCCLBackend, GlooBackend
+from iris.device_barrier import device_barrier
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -92,24 +87,39 @@ class Iris:
         >>> ctx = iris.iris(heap_size=2**31, allocator_type="vmem")
     """
 
-    def __init__(self, heap_size=1 << 30, allocator_type="torch"):
-        # Initialize distributed environment
-        comm, cur_rank, num_ranks = init_distributed()
-        num_gpus = count_devices()
+    def __init__(self, heap_size=1 << 30, allocator_type="torch", coord_backend="nccl"):
+        import sys
 
+        def _dbg(msg):
+            print(f"[iris init] {msg}", file=sys.stderr, flush=True)
+
+        # Initialize distributed environment
+        _dbg(f"creating {coord_backend} backend")
+        if coord_backend == "gloo":
+            self.dist = GlooBackend()
+        else:
+            self.dist = NCCLBackend()
+
+        num_gpus = count_devices()
+        cur_rank = self.dist.rank
+        num_ranks = self.dist.world_size
+        assert num_ranks > 0, f"Invalid world_size: {num_ranks}"
+        assert 0 <= cur_rank < num_ranks, f"Invalid rank/world_size: {cur_rank}/{num_ranks}"
+        assert num_gpus > 0, "No GPUs available"
         gpu_id = cur_rank % num_gpus
         set_device(gpu_id)
 
-        self.comm = comm
         self.num_ranks = num_ranks
         self.cur_rank = cur_rank
         self.gpu_id = gpu_id
         self.heap_size = heap_size
 
         # Initialize symmetric heap with specified allocator
-        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type)
+        _dbg(f"rank={cur_rank}/{num_ranks} creating SymmetricHeap(allocator={allocator_type}, heap={heap_size})")
+        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type, dist_backend=self.dist)
         self.device = f"cuda:{gpu_id}"
         self.heap_bases = self.heap.get_heap_bases()
+        _dbg(f"rank={cur_rank}/{num_ranks} heap OK")
 
         if is_simulation_env():
             import json
@@ -128,7 +138,7 @@ class Iris:
                     indent=2,
                 )
 
-        distributed_barrier()
+        self.dist.host_barrier()
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
@@ -320,12 +330,13 @@ class Iris:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = distributed_broadcast_scalar(is_tensor, source_rank)
+        is_tensor = self.dist.broadcast(is_tensor, source_rank)
 
         if is_tensor:
-            return distributed_broadcast_tensor(value, root=source_rank)
+            data = np.asarray(value) if self.cur_rank == source_rank else None
+            return self.dist.broadcast(data, source_rank)
         else:
-            return distributed_broadcast_scalar(value, source_rank)
+            return self.dist.broadcast(value if self.cur_rank == source_rank else None, source_rank)
 
     def zeros_like(
         self, input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format
@@ -993,14 +1004,11 @@ class Iris:
             >>> ctx.barrier()  # Synchronize all ranks
             >>> ctx.barrier(group=my_group)  # Synchronize only ranks in my_group
         """
-        # Wait for all GPUs to finish work
-        if stream is None:
-            torch.cuda.synchronize()
-        else:
-            stream.synchronize()
+        self.dist.host_barrier(stream)
 
-        # Distributed barrier
-        distributed_barrier(group=group)
+    def host_barrier(self, stream=None):
+        """Host-side barrier via the dist backend (cuda sync + dist.barrier)."""
+        self.dist.host_barrier(stream)
 
     def device_barrier(self, group=None):
         """
@@ -1023,13 +1031,14 @@ class Iris:
         """
         if group not in self._device_barrier_state:
             self._device_barrier_state[group] = self.zeros((self.num_ranks,), dtype=torch.int32)
-
-        distributed_device_barrier(
+        _, rank_global, world_size, rank_start, rank_stride = self.dist.extract_group_info(group)
+        device_barrier(
             self._device_barrier_state[group],
-            group,
-            self.cur_rank,
-            self.num_ranks,
-            self.get_heap_bases(),
+            rank_global,
+            world_size,
+            rank_start,
+            rank_stride,
+            self.heap.get_heap_bases(),
         )
 
     def get_device(self):
@@ -1125,6 +1134,20 @@ class Iris:
             """
             self._iris = iris_instance
 
+        def _validate_tensors(self, input_tensor, output_tensor):
+            """Validate tensor preconditions for all CCL operations."""
+            assert input_tensor.is_cuda, f"input_tensor must be on GPU, got {input_tensor.device}"
+            assert output_tensor.is_cuda, f"output_tensor must be on GPU, got {output_tensor.device}"
+            assert input_tensor.is_contiguous(), "input_tensor must be contiguous"
+            assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
+            heap = self._iris.heap
+            assert heap.is_symmetric(input_tensor), (
+                f"input_tensor not on symmetric heap: ptr={input_tensor.data_ptr():#x}"
+            )
+            assert heap.is_symmetric(output_tensor), (
+                f"output_tensor not on symmetric heap: ptr={output_tensor.data_ptr():#x}"
+            )
+
         def all_to_all(self, output_tensor, input_tensor, group=None, async_op=False, config=None):
             """
             All-to-all collective operation.
@@ -1155,6 +1178,7 @@ class Iris:
                 >>> # Async operation (no barrier)
                 >>> ctx.ccl.all_to_all(output_tensor, input_tensor, async_op=True)
             """
+            self._validate_tensors(input_tensor, output_tensor)
             from iris.ccl.all_to_all import all_to_all as _all_to_all
 
             _all_to_all(output_tensor, input_tensor, self._iris, group=group, async_op=async_op, config=config)
@@ -1190,6 +1214,7 @@ class Iris:
                 >>> # Async operation (no barrier)
                 >>> ctx.ccl.all_gather(output_tensor, input_tensor, async_op=True)
             """
+            self._validate_tensors(input_tensor, output_tensor)
             from iris.ccl.all_gather import all_gather as _all_gather
 
             _all_gather(output_tensor, input_tensor, self._iris, group=group, async_op=async_op, config=config)
@@ -1207,6 +1232,7 @@ class Iris:
             Returns:
                 Workspace object that can be passed to ``all_reduce``.
             """
+            self._validate_tensors(input_tensor, output_tensor)
             from iris.ccl.all_reduce import all_reduce_preamble as _all_reduce_preamble
 
             return _all_reduce_preamble(
@@ -1257,6 +1283,7 @@ class Iris:
                 >>> # Async operation (no barrier)
                 >>> ctx.ccl.all_reduce(output_tensor, input_tensor, async_op=True)
             """
+            self._validate_tensors(input_tensor, output_tensor)
             from iris.ccl.all_reduce import all_reduce as _all_reduce
             from iris.ccl import ReduceOp
 
@@ -1305,6 +1332,7 @@ class Iris:
                 >>> config = Config(reduce_scatter_variant="two_shot", all_reduce_distribution=1)
                 >>> ctx.ccl.reduce_scatter(output_tensor, input_tensor, config=config)
             """
+            self._validate_tensors(input_tensor, output_tensor)
             from iris.ccl.reduce_scatter import reduce_scatter as _reduce_scatter
             from iris.ccl import ReduceOp
 
@@ -2662,7 +2690,7 @@ def atomic_max(
     return tl.atomic_max(translated_ptr, val, mask=mask, sem=sem, scope=scope)
 
 
-def iris(heap_size=1 << 30, allocator_type="torch"):
+def iris(heap_size=1 << 30, allocator_type="torch", coord_backend="nccl"):
     """
     Create and return an Iris instance with the specified heap size.
 
@@ -2670,6 +2698,8 @@ def iris(heap_size=1 << 30, allocator_type="torch"):
         heap_size (int): Size of the heap in bytes. Defaults to 1GB.
         allocator_type (str): Type of allocator to use. Options: "torch" (default), "vmem".
                               Can be overridden with IRIS_ALLOCATOR environment variable.
+        coord_backend (str): Backend for init-time coordination. "gloo" avoids NCCL
+                             watchdog issues during CUDA graph capture. Default: "nccl".
 
     Returns:
         Iris: An initialized Iris instance.
@@ -2683,4 +2713,4 @@ def iris(heap_size=1 << 30, allocator_type="torch"):
         >>> iris_ctx = iris.iris(2**30, allocator_type="vmem")
         >>> tensor = iris_ctx.zeros(1024, 1024)
     """
-    return Iris(heap_size, allocator_type)
+    return Iris(heap_size, allocator_type, coord_backend)

@@ -86,7 +86,7 @@ def all_reduce_preamble(
 
     if variant in (VARIANT_ATOMIC, VARIANT_SPINLOCK, VARIANT_ONE_SHOT):
         output_tensor.zero_()
-        shmem.barrier()
+        shmem.host_barrier()
 
     elif variant == VARIANT_RING:
         num_pid_m = (M + config.block_size_m - 1) // config.block_size_m
@@ -109,7 +109,7 @@ def all_reduce_preamble(
             workspace.flags.zero_()
 
         output_tensor.zero_()
-        shmem.barrier()
+        shmem.host_barrier()
 
     elif variant == VARIANT_TWO_SHOT:
         pass
@@ -896,9 +896,7 @@ def all_reduce(
             next_rank = (rank_in_group + 1) % world_size
         else:
             # Group case: get the group ranks and find next in ring
-            import torch.distributed as dist
-
-            group_ranks = dist.get_process_group_ranks(group)
+            group_ranks = shmem.dist.get_process_group_ranks(group)
             next_rank_in_group = (rank_in_group + 1) % world_size
             next_rank = group_ranks[next_rank_in_group]
 
@@ -986,6 +984,6 @@ def all_reduce(
         workspace.prepared = False
 
     if not async_op:
-        shmem.barrier()
+        shmem.host_barrier()
 
     return workspace

@@ -8,6 +8,7 @@ This allocator provides fine-grained control over virtual and physical memory,
 enabling features like memory oversubscription and on-demand paging.
 """
 
+import sys
 import torch
 import os
 from typing import Dict
@@ -30,6 +31,11 @@ from ..hip import (
     hipMemLocationTypeDevice,
     hipMemAccessFlagsProtReadWrite,
 )
+
+
+def _dbg(msg: str, rank: object = "?") -> None:
+    """Debug print to stderr with flush for crash debugging."""
+    print(f"[iris vmem rank={rank}] {msg}", file=sys.stderr, flush=True)
 
 
 class VMemAllocator(BaseAllocator):
@@ -62,16 +68,30 @@ class VMemAllocator(BaseAllocator):
         self.va_multiplier = va_multiplier
         self.device = torch.device(f"cuda:{device_id}")
         self.lock = Lock()
+
+        assert heap_size > 0, f"Invalid heap_size: {heap_size}"
+        assert 0 <= device_id, f"Invalid device_id: {device_id}"
+
+        _dbg(f"get_allocation_granularity(device={device_id})", rank)
         self.granularity = get_allocation_granularity(self.device_id)
+        assert self.granularity > 0, f"Invalid granularity: {self.granularity}"
+
         self.aligned_heap_size = (heap_size + self.granularity - 1) & ~(self.granularity - 1)
         self.va_size = self.aligned_heap_size
+
+        _dbg(f"mem_address_reserve(size={self.va_size}, gran={self.granularity})", rank)
         self.base_va = mem_address_reserve(self.va_size, self.granularity, 0)
+        assert self.base_va != 0, "mem_address_reserve returned null VA"
 
         self.minimal_size = min(2 << 20, self.aligned_heap_size // 2)
         if self.minimal_size < self.granularity:
             self.minimal_size = self.granularity
 
+        _dbg(f"mem_create(size={self.minimal_size}, device={self.device_id})", rank)
         self.minimal_handle = mem_create(self.minimal_size, self.device_id)
+        assert self.minimal_handle is not None, "mem_create returned None"
+
+        _dbg(f"mem_map(va={self.base_va:#x}, size={self.minimal_size})", rank)
         mem_map(self.base_va, self.minimal_size, 0, self.minimal_handle)
 
         # ROCm: mem_set_access must be called cumulatively from base_va (see rocm-systems#2667)
@@ -84,6 +104,11 @@ class VMemAllocator(BaseAllocator):
             self.access_descs.append(desc)
 
         self.cumulative_mapped_size = self.minimal_size
+        _dbg(
+            f"mem_set_access(va={self.base_va:#x}, size={self.cumulative_mapped_size}, "
+            f"num_descs={len(self.access_descs)})",
+            rank,
+        )
         mem_set_access(self.base_va, self.cumulative_mapped_size, self.access_descs)
 
         self.allocations: Dict[int, tuple] = {}
@@ -92,6 +117,7 @@ class VMemAllocator(BaseAllocator):
         self.current_offset = self.minimal_size
 
         self.world_size = world_size
+        _dbg(f"VMemAllocator init OK (va={self.base_va:#x}, heap={self.aligned_heap_size})", rank)
 
     def get_base_address(self) -> int:
         """Get the base address of the heap."""
@@ -241,7 +267,19 @@ class VMemAllocator(BaseAllocator):
                 raise RuntimeError("Only contiguous tensors can be imported; call .contiguous() before as_symmetric()")
 
             external_ptr = external_tensor.data_ptr()
+            assert external_ptr != 0, "Cannot import tensor with null data pointer"
+            assert external_tensor.device == self.device, (
+                f"Tensor on device {external_tensor.device} but heap on device {self.device}"
+            )
+
             alloc_base, alloc_size = get_address_range(external_ptr)
+            assert alloc_base != 0 and alloc_size > 0, (
+                f"Invalid allocation range for ptr={external_ptr:#x}: base={alloc_base:#x}, size={alloc_size}"
+            )
+            assert alloc_base <= external_ptr < alloc_base + alloc_size, (
+                f"Pointer {external_ptr:#x} outside its allocation [{alloc_base:#x}, {alloc_base + alloc_size:#x})"
+            )
+
             offset_in_alloc = external_ptr - alloc_base
             aligned_size = (alloc_size + self.granularity - 1) & ~(self.granularity - 1)
             aligned_offset = (self.current_offset + self.granularity - 1) & ~(self.granularity - 1)
@@ -256,6 +294,7 @@ class VMemAllocator(BaseAllocator):
                 )
 
             dmabuf_fd, export_base, export_size = export_dmabuf_handle(alloc_base, alloc_size)
+            assert dmabuf_fd >= 0, f"Invalid DMA-BUF fd={dmabuf_fd} for ptr={external_ptr:#x}"
             aligned_export_size = (export_size + self.granularity - 1) & ~(self.granularity - 1)
             target_va = self.base_va + aligned_offset
             imported_handle = mem_import_from_shareable_handle(dmabuf_fd)
