@@ -44,6 +44,7 @@ class Config:
                                  (default: auto-set to block_size_n // world_size at runtime)
         reduce_scatter_variant: Variant for reduce-scatter operation (default: "two_shot")
                                 Only "two_shot" is supported
+
     Example:
         >>> import iris
         >>> from iris.ccl import Config
