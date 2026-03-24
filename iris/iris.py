@@ -42,8 +42,8 @@ import triton
 import triton.language as tl
 from triton.language.core import _aggregate as aggregate
 
-from iris.device_barrier import device_barrier
 from iris.dist_backend import NCCLBackend, GlooBackend
+from iris.device_barrier import device_barrier
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -51,7 +51,7 @@ from iris.hip import (
 )
 from iris.symmetric_heap import SymmetricHeap
 import numpy as np
-from typing import Any
+from typing import Any, Dict
 import torch
 import logging
 
@@ -128,16 +128,11 @@ class Iris:
                     indent=2,
                 )
 
+        self._device_barrier_state: Dict[Any, torch.Tensor] = {}
         self.dist.barrier()
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
-
-        # Lazy initialization for ops interface
-        self._ops = None
-
-        # Device-side barrier state, keyed by process group (None = all ranks).
-        self._device_barrier_state: dict[Any, torch.Tensor] = {}
 
         # Initialize tracing
         self.tracing = Tracing(self)
@@ -986,43 +981,27 @@ class Iris:
 
     def barrier(self, stream=None):
         """
-        Synchronize ranks within the specified group and their CUDA devices.
+        Synchronize ranks and their CUDA devices.
 
-        When using GlooBackend, dispatches to device_barrier() which is CUDA
-        graph capturable. Otherwise uses host-side sync + distributed barrier.
+        Uses the dist backend's host-side barrier (cuda sync + dist.barrier).
 
         Args:
-            stream: If stream is given: wait only for that stream before barrier. If stream is None: legacy behavior (device-wide sync).
-            group (ProcessGroup, optional): The process group to synchronize.
-                If None, uses the default process group (all ranks).
+            stream: If given, wait only for that stream before barrier.
+                If None, full device sync (legacy behavior).
 
         Example:
             >>> ctx = iris.iris(1 << 20)
             >>> ctx.barrier()  # Synchronize all ranks
-            >>> ctx.barrier(group=my_group)  # Synchronize only ranks in my_group
         """
-        if isinstance(self.dist, GlooBackend):
-            self.device_barrier()
-            return
-
-        # Host-side path: sync GPU then distributed barrier
-        if stream is None:
-            torch.cuda.synchronize()
-        else:
-            stream.synchronize()
-
-        self.dist.barrier()
+        self.dist.barrier(stream)
 
     def device_barrier(self, group=None):
         """
         Device-side barrier that is CUDA graph capturable.
 
-        Unlike ``barrier()`` which uses host-side ``torch.distributed.barrier()``,
-        this uses device-side atomic operations on the symmetric heap to synchronize
-        ranks. Stateless w.r.t. host-side epoch tracking: each rank's flag on
-        the heap serves as its own epoch counter, managed entirely by the GPU
-        via atomic_add. A persistent per-group flags tensor is cached in
-        ``_device_barrier_state``.
+        Uses device-side atomic operations on the symmetric heap to synchronize
+        ranks. Each rank's flag on the heap serves as its own epoch counter,
+        managed entirely by the GPU via atomic_add.
 
         Args:
             group (ProcessGroup, optional): The process group to synchronize.
@@ -1033,16 +1012,13 @@ class Iris:
             >>> ctx.device_barrier()  # Synchronize all ranks on device
         """
         if group not in self._device_barrier_state:
-            self._device_barrier_state[group] = self.zeros((self.num_ranks,), dtype=torch.int32)
-
+            self._device_barrier_state[group] = self.heap.allocate(self.dist.world_size, torch.int32)
+            self._device_barrier_state[group].zero_()
         _, rank_global, world_size, rank_start, rank_stride = self.dist.extract_group_info(group)
         device_barrier(
             self._device_barrier_state[group],
-            rank_global,
-            world_size,
-            rank_start,
-            rank_stride,
-            self.get_heap_bases(),
+            rank_global, world_size, rank_start, rank_stride,
+            self.heap.get_heap_bases(),
         )
 
     def get_device(self):
