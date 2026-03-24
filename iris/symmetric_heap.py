@@ -156,7 +156,6 @@ class SymmetricHeap:
         Refresh peer DMA-BUF imports using segmented export/import.
         Collective: all ranks must call together. Do not cache heap_bases.
         """
-        import torch.distributed as dist
         from iris.fd_passing import send_fd, recv_fd
         from iris.hip import (
             export_dmabuf_handle,
@@ -175,9 +174,7 @@ class SymmetricHeap:
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
         local_base_arr = np.array([my_base], dtype=np.int64)
-        all_bases_arr = (
-            self._dist.allgather(local_base_arr).reshape(self.num_ranks).astype(np.int64)
-        )
+        all_bases_arr = self._dist.allgather(local_base_arr).reshape(self.num_ranks).astype(np.int64)
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
         if self.num_ranks == 1 or self.fd_conns is None:
