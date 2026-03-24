@@ -1017,7 +1017,10 @@ class Iris:
         _, rank_global, world_size, rank_start, rank_stride = self.dist.extract_group_info(group)
         device_barrier(
             self._device_barrier_state[group],
-            rank_global, world_size, rank_start, rank_stride,
+            rank_global,
+            world_size,
+            rank_start,
+            rank_stride,
             self.heap.get_heap_bases(),
         )
 
