@@ -250,5 +250,4 @@ def reduce_scatter(
     )
 
     if not async_op:
-        barrier_fn = shmem.device_barrier if shmem.use_device_barrier else shmem.barrier
-        barrier_fn()
+        shmem._dist.ccl_barrier(shmem)

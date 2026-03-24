@@ -44,11 +44,9 @@ from triton.language.core import _aggregate as aggregate
 
 from iris._distributed_helpers import (
     init_distributed,
-    distributed_barrier,
     distributed_device_barrier,
-    distributed_broadcast_scalar,
-    distributed_broadcast_tensor,
 )
+from iris.dist_backend import NCCLBackend, GlooBackend
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -58,7 +56,6 @@ from iris.symmetric_heap import SymmetricHeap
 import numpy as np
 from typing import Any
 import torch
-import torch.distributed as dist
 import logging
 
 # Import logging functionality from the separate logging module
@@ -109,24 +106,14 @@ class Iris:
         self.gpu_id = gpu_id
         self.heap_size = heap_size
 
-        # Coordination group for init-time collective ops (allgather, barrier)
-        # and runtime barrier choice (device_barrier vs host barrier).
-        #
-        # "gloo": CPU-only backend with no watchdog thread. Prevents the
-        #   ProcessGroupNCCL watchdog from accumulating work items that crash
-        #   with hipErrorCapturedEvent during CUDA graph capture on ROCm.
-        #   Runtime CCL barriers use device_barrier (GPU-side atomics).
-        #
-        # "nccl": Default PG. Runtime CCL barriers use host-side barrier.
+        # Distributed backend for all external collective ops.
         if coord_backend == "gloo":
-            self._coord_group = dist.new_group(backend="gloo")
-            self.use_device_barrier = True
+            self.dist = GlooBackend()
         else:
-            self._coord_group = dist.group.WORLD
-            self.use_device_barrier = False
+            self.dist = NCCLBackend()
 
         # Initialize symmetric heap with specified allocator
-        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type, coord_group=self._coord_group)
+        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type, dist_backend=self.dist)
         self.device = f"cuda:{gpu_id}"
         self.heap_bases = self.heap.get_heap_bases()
 
@@ -146,7 +133,7 @@ class Iris:
                     indent=2,
                 )
 
-        distributed_barrier(group=self._coord_group)
+        self.dist.barrier()
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
@@ -335,12 +322,12 @@ class Iris:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = distributed_broadcast_scalar(is_tensor, source_rank, group=self._coord_group)
+        is_tensor = self.dist.broadcast_scalar(is_tensor, source_rank)
 
         if is_tensor:
-            return distributed_broadcast_tensor(value, root=source_rank, group=self._coord_group)
+            return self.dist.broadcast_tensor(value, source_rank)
         else:
-            return distributed_broadcast_scalar(value, source_rank, group=self._coord_group)
+            return self.dist.broadcast_scalar(value, source_rank)
 
     def zeros_like(
         self, input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format
@@ -984,7 +971,7 @@ class Iris:
 
         return context_tensor
 
-    def barrier(self, stream=None, group=None):
+    def barrier(self, stream=None):
         """
         Synchronize ranks within the specified group and their CUDA devices.
 
@@ -1009,7 +996,7 @@ class Iris:
             stream.synchronize()
 
         # Distributed barrier
-        distributed_barrier(group=group)
+        self.dist.barrier()
 
     def device_barrier(self, group=None):
         """

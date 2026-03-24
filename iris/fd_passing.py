@@ -140,7 +140,7 @@ def setup_fd_mesh(rank: int, world_size: int, all_paths: Dict[int, str]) -> Dict
     return conns
 
 
-def setup_fd_infrastructure(cur_rank: int, num_ranks: int, coord_group=None):
+def setup_fd_infrastructure(cur_rank: int, num_ranks: int, dist_backend=None):
     """
     Setup FD passing infrastructure for multi-rank communication.
 
@@ -149,7 +149,7 @@ def setup_fd_infrastructure(cur_rank: int, num_ranks: int, coord_group=None):
     Args:
         cur_rank: Current process rank
         num_ranks: Total number of ranks
-        coord_group: Process group for coordination. None uses the default PG.
+        dist_backend: DistBackend for collective ops.
 
     Returns:
         Dictionary mapping peer rank -> socket, or None for single rank
@@ -157,17 +157,15 @@ def setup_fd_infrastructure(cur_rank: int, num_ranks: int, coord_group=None):
     if num_ranks <= 1:
         return None
 
-    import torch.distributed as dist
-    from iris._distributed_helpers import distributed_barrier
-
     # Setup socket mesh for FD passing
     prefix = "iris-dmabuf"
     my_path = make_rank_sock_path(prefix, cur_rank)
-    obj_list = [None for _ in range(num_ranks)]
-    dist.all_gather_object(obj_list, my_path, group=coord_group)
-    all_paths = {r: obj_list[r] for r in range(num_ranks)}
-    distributed_barrier(group=coord_group)
+    # Gather socket paths from all ranks (strings, not tensors)
+    all_paths = {}
+    for r in range(num_ranks):
+        all_paths[r] = dist_backend.broadcast_scalar(my_path if r == cur_rank else None, root=r)
+    dist_backend.barrier()
     fd_conns = setup_fd_mesh(cur_rank, num_ranks, all_paths)
-    distributed_barrier(group=coord_group)
+    dist_backend.barrier()
 
     return fd_conns

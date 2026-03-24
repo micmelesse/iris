@@ -14,7 +14,6 @@ import os
 
 from iris.allocators import TorchAllocator, VMemAllocator
 from iris.fd_passing import setup_fd_infrastructure
-from iris._distributed_helpers import distributed_allgather
 
 
 class SymmetricHeap:
@@ -34,7 +33,7 @@ class SymmetricHeap:
         cur_rank: int,
         num_ranks: int,
         allocator_type: str = "torch",
-        coord_group=None,
+        dist_backend=None,
     ):
         """
         Initialize symmetric heap.
@@ -45,8 +44,7 @@ class SymmetricHeap:
             cur_rank: Current process rank
             num_ranks: Total number of ranks
             allocator_type: Type of allocator ("torch" or "vmem"); default "torch"
-            coord_group: Process group for init-time coordination (e.g. gloo).
-                None uses the default PG.
+            dist_backend: DistBackend for collective ops.
 
         Raises:
             ValueError: If allocator_type is not supported
@@ -55,7 +53,7 @@ class SymmetricHeap:
         self.device_id = device_id
         self.cur_rank = cur_rank
         self.num_ranks = num_ranks
-        self._coord_group = coord_group
+        self._dist = dist_backend
         allocator_type = os.environ.get("IRIS_ALLOCATOR", allocator_type).lower()
 
         if allocator_type == "torch":
@@ -65,7 +63,7 @@ class SymmetricHeap:
         else:
             raise ValueError(f"Unknown allocator type: {allocator_type}. Supported: 'torch', 'vmem'")
 
-        self.fd_conns = setup_fd_infrastructure(cur_rank, num_ranks, coord_group=coord_group)
+        self.fd_conns = setup_fd_infrastructure(cur_rank, num_ranks, dist_backend=dist_backend)
         device = self.allocator.get_device()
 
         # Use int64 instead of uint64 for gloo backend compatibility
@@ -171,14 +169,14 @@ class SymmetricHeap:
             hipMemAccessFlagsProtReadWrite,
         )
 
-        if dist.is_initialized():
-            dist.barrier(group=self._coord_group)
+        if self._dist is not None:
+            self._dist.barrier()
 
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
         local_base_arr = np.array([my_base], dtype=np.int64)
         all_bases_arr = (
-            distributed_allgather(local_base_arr, group=self._coord_group).reshape(self.num_ranks).astype(np.int64)
+            self._dist.allgather(local_base_arr).reshape(self.num_ranks).astype(np.int64)
         )
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
@@ -276,8 +274,8 @@ class SymmetricHeap:
 
             os.close(fd)
 
-        if dist.is_initialized():
-            dist.barrier(group=self._coord_group)
+        if self._dist is not None:
+            self._dist.barrier()
 
     def as_symmetric(self, external_tensor: torch.Tensor) -> torch.Tensor:
         """
