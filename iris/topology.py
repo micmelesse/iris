@@ -13,7 +13,7 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-from iris.dist_backend import is_distributed_initialized, init_distributed
+from iris.dist_backend import NCCLBackend
 
 logger = logging.getLogger("iris.topology")
 
@@ -1062,8 +1062,6 @@ class TopologyDiscovery:
     """
 
     def __init__(self, iris_ctx=None):
-        from iris.dist_backend import NCCLBackend
-
         self._iris_ctx = iris_ctx
         self._topology: Optional[TopologyMap] = None
 
@@ -1088,11 +1086,9 @@ class TopologyDiscovery:
             # device assigned to this process, otherwise all ranks fight over
             # GPU 0 and init either fails or produces world_size=1.
             torch.cuda.set_device(self.gpu_id)
-            if is_distributed_initialized():
-                _, self.rank, self.world_size = init_distributed()
-                self._dist = NCCLBackend()
-            else:
-                raise RuntimeError("TopologyDiscovery requires an initialized distributed process group.")
+            self._dist = NCCLBackend()
+            self.rank = self._dist.rank
+            self.world_size = self._dist.world_size
 
     @property
     def topology(self) -> Optional[TopologyMap]:

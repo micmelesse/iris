@@ -877,9 +877,7 @@ def all_reduce(
             next_rank = (rank_in_group + 1) % world_size
         else:
             # Group case: get the group ranks and find next in ring
-            from iris.dist_backend import get_process_group_ranks
-
-            group_ranks = get_process_group_ranks(group)
+            group_ranks = shmem.dist.get_process_group_ranks(group)
             next_rank_in_group = (rank_in_group + 1) % world_size
             next_rank = group_ranks[next_rank_in_group]
 

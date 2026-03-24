@@ -5,199 +5,14 @@
 Distributed backend for iris.
 
 This is the ONLY module in iris that imports torch.distributed.
-Contains:
-- DistBackend protocol and NCCLBackend/GlooBackend implementations
-- Module-level functions: init_distributed, extract_group_info, etc.
-- Device-side barrier Triton kernels (graph-capturable)
+Contains the DistBackend protocol and NCCLBackend/GlooBackend implementations.
 """
 
-from typing import Any, List, Protocol, runtime_checkable
+from typing import Any, List, Protocol, Tuple, runtime_checkable
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers (used before a DistBackend instance exists)
-# ---------------------------------------------------------------------------
-
-
-def init_distributed():
-    """
-    Initialize PyTorch distributed and return communicator info.
-
-    Returns:
-        tuple: (communicator_placeholder, rank, world_size)
-        Note: communicator_placeholder is None since PyTorch distributed
-              uses global state rather than explicit communicator objects
-    """
-    if not dist.is_initialized():
-        raise RuntimeError("PyTorch distributed is not initialized. Call dist.init_process_group() first.")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    return None, rank, world_size
-
-
-def extract_group_info(group, rank, num_ranks):
-    """
-    Extract rank and stride information for a process group.
-
-    Args:
-        group: ProcessGroup or None. If None, uses the provided rank/num_ranks
-            as the default (all-ranks) group.
-        rank: Global rank of the current process.
-        num_ranks: Total number of ranks in the default group.
-
-    Returns:
-        Tuple of (rank_in_group, rank_global, world_size, rank_start, rank_stride)
-
-    Examples:
-        >>> extract_group_info(None, 2, 4)
-        (2, 2, 4, 0, 1)
-
-        >>> extract_group_info(dp_group, 8, 16)
-        (2, 8, 4, 0, 4)
-    """
-    if group is None:
-        return rank, rank, num_ranks, 0, 1
-
-    if not dist.is_initialized():
-        raise RuntimeError(
-            "torch.distributed must be initialized to use ProcessGroup. "
-            "Call torch.distributed.init_process_group() first."
-        )
-
-    group_ranks = dist.get_process_group_ranks(group)
-    world_size = len(group_ranks)
-    rank_global = rank
-
-    if rank_global not in group_ranks:
-        raise RuntimeError(
-            f"Rank {rank_global} is not part of the specified process group. Group contains ranks: {group_ranks}"
-        )
-
-    rank_in_group = group_ranks.index(rank_global)
-
-    if len(group_ranks) > 1:
-        strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
-        if not all(s == strides[0] for s in strides):
-            raise NotImplementedError(
-                f"Non-strided process groups are not yet supported. "
-                f"Group ranks: {group_ranks}. "
-                f"Please use groups with uniform stride (e.g., [0,1,2,3] or [0,4,8,12])."
-            )
-        rank_start = group_ranks[0]
-        rank_stride = strides[0]
-        if rank_stride == 0:
-            raise ValueError(
-                f"Invalid process group: rank_stride is 0, indicating duplicate ranks. "
-                f"Group ranks: {group_ranks}. "
-                f"Each rank must appear exactly once in a process group."
-            )
-    else:
-        rank_start = group_ranks[0]
-        rank_stride = 1
-
-    return rank_in_group, rank_global, world_size, rank_start, rank_stride
-
-
-def get_process_group_ranks(group) -> List[int]:
-    """Get the list of global ranks in a process group."""
-    return dist.get_process_group_ranks(group)
-
-
-def is_distributed_initialized() -> bool:
-    """Check if torch.distributed is initialized."""
-    return dist.is_initialized()
-
-
-# ---------------------------------------------------------------------------
-# Device-side barrier (Triton kernels, graph-capturable)
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
-    """Translate a pointer from one rank's address space to another's."""
-    from_base = tl.load(heap_bases + from_rank)
-    to_base = tl.load(heap_bases + to_rank)
-    offset = tl.cast(ptr, tl.uint64) - from_base
-    translated_ptr = tl.cast(tl.cast(to_base, tl.pointer_type(tl.int8)) + offset, ptr.dtype)
-    return translated_ptr
-
-
-@triton.jit
-def _device_barrier_kernel(
-    flags_ptr,
-    iris_rank,
-    world_size: tl.constexpr,
-    rank_start,
-    rank_stride,
-    heap_bases,
-    MAX_SPINS: tl.constexpr = 1_000_000_000,
-):
-    """
-    Device-side barrier using atomic operations on the symmetric heap.
-    CUDA graph capturable.
-
-    Launched with grid=(1,). A single CTA:
-    1. Atomically increments its own flag (atomic_add, release)
-    2. Serially polls each remote rank's flag for the same value (acquire)
-    """
-    own_flag_ptr = flags_ptr + iris_rank
-    own_translated = _translate_ptr(own_flag_ptr, iris_rank, iris_rank, heap_bases)
-    old = tl.atomic_add(own_translated, 1, sem="release", scope="sys")
-    target = old + 1
-
-    for i in range(world_size):
-        remote_rank = rank_start + i * rank_stride
-        if remote_rank != iris_rank:
-            remote_flag_ptr = flags_ptr + remote_rank
-            remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
-            spin_count = 0
-            while (
-                tl.atomic_cas(
-                    remote_translated,
-                    target,
-                    target,
-                    sem="acquire",
-                    scope="sys",
-                )
-                < target
-            ):
-                spin_count += 1
-                tl.device_assert(spin_count < MAX_SPINS, "device_barrier: timeout")
-
-
-def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
-    """
-    Device-side barrier using atomic operations on the symmetric heap.
-    CUDA graph capturable.
-
-    Args:
-        flags: int32 tensor on symmetric heap, one element per rank.
-        group: ProcessGroup or None. If None, uses all ranks.
-        rank: Global rank of this process.
-        num_ranks: Total number of ranks in the default group.
-        heap_bases: Tensor of heap base addresses for all ranks.
-    """
-    _, rank_global, world_size, rank_start, rank_stride = extract_group_info(group, rank, num_ranks)
-    _device_barrier_kernel[(1,)](
-        flags,
-        rank_global,
-        world_size,
-        rank_start,
-        rank_stride,
-        heap_bases,
-    )
-
-
-# ---------------------------------------------------------------------------
-# DistBackend protocol
-# ---------------------------------------------------------------------------
 
 
 @runtime_checkable
@@ -209,6 +24,12 @@ class DistBackend(Protocol):
 
     @property
     def world_size(self) -> int: ...
+
+    def is_initialized(self) -> bool: ...
+
+    def extract_group_info(self, group) -> Tuple[int, int, int, int, int]: ...
+
+    def get_process_group_ranks(self, group) -> List[int]: ...
 
     def allgather(self, data: np.ndarray) -> np.ndarray: ...
 
@@ -229,16 +50,16 @@ class DistBackend(Protocol):
     def recv(self, tensor: torch.Tensor, src: int) -> None: ...
 
 
-# ---------------------------------------------------------------------------
-# NCCLBackend
-# ---------------------------------------------------------------------------
-
-
 class NCCLBackend:
     """DistBackend using the default NCCL process group."""
 
     def __init__(self) -> None:
+        if not self.is_initialized():
+            raise RuntimeError("PyTorch distributed is not initialized. Call dist.init_process_group() first.")
         self._group = dist.group.WORLD
+
+    def is_initialized(self) -> bool:
+        return dist.is_initialized()
 
     @property
     def rank(self) -> int:
@@ -247,6 +68,43 @@ class NCCLBackend:
     @property
     def world_size(self) -> int:
         return dist.get_world_size(self._group)
+
+    def get_process_group_ranks(self, group) -> List[int]:
+        return dist.get_process_group_ranks(group)
+
+    def extract_group_info(self, group) -> Tuple[int, int, int, int, int]:
+        if group is None:
+            return self.rank, self.rank, self.world_size, 0, 1
+
+        group_ranks = dist.get_process_group_ranks(group)
+        world_size = len(group_ranks)
+
+        if self.rank not in group_ranks:
+            raise RuntimeError(
+                f"Rank {self.rank} is not part of the specified process group. "
+                f"Group contains ranks: {group_ranks}"
+            )
+
+        rank_in_group = group_ranks.index(self.rank)
+
+        if len(group_ranks) > 1:
+            strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
+            if not all(s == strides[0] for s in strides):
+                raise NotImplementedError(
+                    f"Non-strided process groups are not yet supported. "
+                    f"Group ranks: {group_ranks}."
+                )
+            rank_start = group_ranks[0]
+            rank_stride = strides[0]
+            if rank_stride == 0:
+                raise ValueError(
+                    f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}."
+                )
+        else:
+            rank_start = group_ranks[0]
+            rank_stride = 1
+
+        return rank_in_group, self.rank, world_size, rank_start, rank_stride
 
     def allgather(self, data: np.ndarray) -> np.ndarray:
         data = np.asarray(data)
@@ -326,11 +184,6 @@ class NCCLBackend:
         dist.recv(tensor, src=src, group=self._group)
 
 
-# ---------------------------------------------------------------------------
-# GlooBackend
-# ---------------------------------------------------------------------------
-
-
 class GlooBackend:
     """DistBackend using a gloo process group.
 
@@ -341,7 +194,12 @@ class GlooBackend:
     """
 
     def __init__(self) -> None:
+        if not self.is_initialized():
+            raise RuntimeError("PyTorch distributed is not initialized. Call dist.init_process_group() first.")
         self._group = dist.new_group(backend="gloo")
+
+    def is_initialized(self) -> bool:
+        return dist.is_initialized()
 
     @property
     def rank(self) -> int:
@@ -350,6 +208,43 @@ class GlooBackend:
     @property
     def world_size(self) -> int:
         return dist.get_world_size(self._group)
+
+    def get_process_group_ranks(self, group) -> List[int]:
+        return dist.get_process_group_ranks(group)
+
+    def extract_group_info(self, group) -> Tuple[int, int, int, int, int]:
+        if group is None:
+            return self.rank, self.rank, self.world_size, 0, 1
+
+        group_ranks = dist.get_process_group_ranks(group)
+        world_size = len(group_ranks)
+
+        if self.rank not in group_ranks:
+            raise RuntimeError(
+                f"Rank {self.rank} is not part of the specified process group. "
+                f"Group contains ranks: {group_ranks}"
+            )
+
+        rank_in_group = group_ranks.index(self.rank)
+
+        if len(group_ranks) > 1:
+            strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
+            if not all(s == strides[0] for s in strides):
+                raise NotImplementedError(
+                    f"Non-strided process groups are not yet supported. "
+                    f"Group ranks: {group_ranks}."
+                )
+            rank_start = group_ranks[0]
+            rank_stride = strides[0]
+            if rank_stride == 0:
+                raise ValueError(
+                    f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}."
+                )
+        else:
+            rank_start = group_ranks[0]
+            rank_stride = 1
+
+        return rank_in_group, self.rank, world_size, rank_start, rank_stride
 
     def allgather(self, data: np.ndarray) -> np.ndarray:
         data = np.asarray(data)

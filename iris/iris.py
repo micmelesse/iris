@@ -42,7 +42,8 @@ import triton
 import triton.language as tl
 from triton.language.core import _aggregate as aggregate
 
-from iris.dist_backend import init_distributed, distributed_device_barrier, NCCLBackend, GlooBackend
+from iris.device_barrier import device_barrier
+from iris.dist_backend import NCCLBackend, GlooBackend
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -89,24 +90,22 @@ class Iris:
         if is_simulation_env():
             allocator_type = "torch"
 
-        # Initialize distributed environment
-        comm, cur_rank, num_ranks = init_distributed()
-        num_gpus = count_devices()
-
-        gpu_id = cur_rank % num_gpus
-        set_device(gpu_id)
-
-        self.comm = comm
-        self.num_ranks = num_ranks
-        self.cur_rank = cur_rank
-        self.gpu_id = gpu_id
-        self.heap_size = heap_size
-
         # Distributed backend for all external collective ops.
         if coord_backend == "gloo":
             self.dist = GlooBackend()
         else:
             self.dist = NCCLBackend()
+
+        num_gpus = count_devices()
+        cur_rank = self.dist.rank
+        num_ranks = self.dist.world_size
+        gpu_id = cur_rank % num_gpus
+        set_device(gpu_id)
+
+        self.num_ranks = num_ranks
+        self.cur_rank = cur_rank
+        self.gpu_id = gpu_id
+        self.heap_size = heap_size
 
         # Initialize symmetric heap with specified allocator
         self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, allocator_type, dist_backend=self.dist)
@@ -1018,11 +1017,13 @@ class Iris:
         if group not in self._device_barrier_state:
             self._device_barrier_state[group] = self.zeros((self.num_ranks,), dtype=torch.int32)
 
-        distributed_device_barrier(
+        _, rank_global, world_size, rank_start, rank_stride = self.dist.extract_group_info(group)
+        device_barrier(
             self._device_barrier_state[group],
-            group,
-            self.cur_rank,
-            self.num_ranks,
+            rank_global,
+            world_size,
+            rank_start,
+            rank_stride,
             self.get_heap_bases(),
         )
 

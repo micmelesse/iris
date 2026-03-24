@@ -39,7 +39,7 @@ except ImportError as e:
 
 import triton.language as tl
 
-from iris.dist_backend import init_distributed, NCCLBackend
+from iris.dist_backend import NCCLBackend
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -481,22 +481,20 @@ class IrisGluon:
     """
 
     def __init__(self, heap_size=1 << 30):
-        # Initialize distributed environment
-        comm, cur_rank, num_ranks = init_distributed()
-        num_gpus = count_devices()
+        # Distributed backend for all external collective ops.
+        self.dist = NCCLBackend()
 
+        num_gpus = count_devices()
+        cur_rank = self.dist.rank
+        num_ranks = self.dist.world_size
         gpu_id = cur_rank % num_gpus
         set_device(gpu_id)
 
-        self.comm = comm
         self.num_ranks = num_ranks
         self.cur_rank = cur_rank
         self.gpu_id = gpu_id
         self.heap_size = heap_size
         self.device = f"cuda:{gpu_id}"
-
-        # Distributed backend for all external collective ops.
-        self.dist = NCCLBackend()
 
         # Initialize symmetric heap
         self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, dist_backend=self.dist)
