@@ -317,12 +317,30 @@ class Iris:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = self.dist.broadcast_scalar(is_tensor, source_rank)
+        obj = [is_tensor]
+        self.dist.broadcast_object_list(obj, source_rank)
+        is_tensor = obj[0]
 
         if is_tensor:
-            return self.dist.broadcast_tensor(value, source_rank)
+            # Broadcast tensor: first share metadata, then the data
+            if self.cur_rank == source_rank:
+                tensor = torch.as_tensor(value)
+                metadata = [tensor.shape, tensor.dtype]
+            else:
+                metadata = [None, None]
+                tensor = None
+            self.dist.broadcast_object_list(metadata, source_rank)
+            shape, dtype = metadata
+            if self.cur_rank != source_rank:
+                tensor = torch.empty(shape, dtype=dtype)
+            device = torch.device("cuda", torch.cuda.current_device())
+            tensor = tensor.to(device)
+            self.dist.broadcast(tensor, source_rank)
+            return tensor.cpu().numpy()
         else:
-            return self.dist.broadcast_scalar(value, source_rank)
+            obj = [value if self.cur_rank == source_rank else None]
+            self.dist.broadcast_object_list(obj, source_rank)
+            return obj[0]
 
     def zeros_like(
         self, input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format

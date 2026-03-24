@@ -247,7 +247,7 @@ class Tracing:
         # Gather event counts to rank 0
         event_counts = torch.tensor([len(events_bytes)], dtype=torch.int64, device="cuda")
         all_event_counts = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(self.iris.num_ranks)]
-        self.iris.dist.all_gather_cuda(all_event_counts, event_counts)
+        self.iris.dist.all_gather(all_event_counts, event_counts)
 
         # Synchronize before point-to-point communication to ensure proper ordering
         self.iris.dist.barrier()

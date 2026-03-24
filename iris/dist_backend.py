@@ -8,16 +8,20 @@ This is the ONLY module in iris that imports torch.distributed.
 Contains the DistBackend protocol and NCCLBackend/GlooBackend implementations.
 """
 
-from typing import Any, List, Protocol, Tuple, runtime_checkable
+from typing import List, Protocol, Tuple, runtime_checkable
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
 
 @runtime_checkable
 class DistBackend(Protocol):
-    """Interface for all external collective operations."""
+    """Interface for all external collective operations.
+
+    Methods are thin wrappers around torch.distributed primitives.
+    Backends handle device placement (GPU for NCCL, CPU for Gloo)
+    transparently. Callers pass tensors and get tensors back.
+    """
 
     @property
     def rank(self) -> int: ...
@@ -31,19 +35,13 @@ class DistBackend(Protocol):
 
     def get_process_group_ranks(self, group) -> List[int]: ...
 
-    def allgather(self, data: np.ndarray) -> np.ndarray: ...
+    def all_gather(self, tensor_list: list, tensor: torch.Tensor) -> None: ...
 
-    def allgather_multidim(self, data: np.ndarray) -> np.ndarray: ...
+    def broadcast(self, tensor: torch.Tensor, src: int) -> None: ...
 
-    def allgather_strings(self, local_string: str) -> List[str]: ...
-
-    def broadcast_scalar(self, value: Any, root: int) -> Any: ...
-
-    def broadcast_tensor(self, value: Any, root: int) -> np.ndarray: ...
+    def broadcast_object_list(self, obj_list: list, src: int) -> None: ...
 
     def barrier(self) -> None: ...
-
-    def all_gather_cuda(self, tensor_list: list, tensor: torch.Tensor) -> None: ...
 
     def send(self, tensor: torch.Tensor, dst: int) -> None: ...
 
@@ -81,7 +79,8 @@ class NCCLBackend:
 
         if self.rank not in group_ranks:
             raise RuntimeError(
-                f"Rank {self.rank} is not part of the specified process group. Group contains ranks: {group_ranks}"
+                f"Rank {self.rank} is not part of the specified process group. "
+                f"Group contains ranks: {group_ranks}"
             )
 
         rank_in_group = group_ranks.index(self.rank)
@@ -90,88 +89,32 @@ class NCCLBackend:
             strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
             if not all(s == strides[0] for s in strides):
                 raise NotImplementedError(
-                    f"Non-strided process groups are not yet supported. Group ranks: {group_ranks}."
+                    f"Non-strided process groups are not yet supported. "
+                    f"Group ranks: {group_ranks}."
                 )
             rank_start = group_ranks[0]
             rank_stride = strides[0]
             if rank_stride == 0:
-                raise ValueError(f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}.")
+                raise ValueError(
+                    f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}."
+                )
         else:
             rank_start = group_ranks[0]
             rank_stride = 1
 
         return rank_in_group, self.rank, world_size, rank_start, rank_stride
 
-    def allgather(self, data: np.ndarray) -> np.ndarray:
-        data = np.asarray(data)
-        device = torch.device("cuda", torch.cuda.current_device())
-        data_tensor = torch.from_numpy(data).to(device)
-        gathered = [torch.empty_like(data_tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered, data_tensor, group=self._group)
-        return torch.stack(gathered, dim=0).cpu().numpy()
+    def all_gather(self, tensor_list: list, tensor: torch.Tensor) -> None:
+        dist.all_gather(tensor_list, tensor, group=self._group)
 
-    def allgather_multidim(self, data: np.ndarray) -> np.ndarray:
-        device = torch.device("cuda", torch.cuda.current_device())
-        input_tensor = torch.as_tensor(data).to(device)
-        tensor_list = [torch.empty_like(input_tensor) for _ in range(self.world_size)]
-        dist.all_gather(tensor_list, input_tensor, group=self._group)
-        stacked = torch.stack(tensor_list, dim=0).view(self.world_size, -1)
-        return stacked.cpu().numpy()
+    def broadcast(self, tensor: torch.Tensor, src: int) -> None:
+        dist.broadcast(tensor, src=src, group=self._group)
 
-    def allgather_strings(self, local_string: str) -> List[str]:
-        local_bytes = local_string.encode("utf-8")
-        local_len = len(local_bytes)
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        len_tensor = torch.tensor([local_len], dtype=torch.long, device=device)
-        len_list = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(self.world_size)]
-        dist.all_gather(len_list, len_tensor, group=self._group)
-        max_len = max(t.item() for t in len_list)
-
-        if max_len == 0:
-            return [""] * self.world_size
-
-        padded = bytearray(local_bytes) + bytearray(max_len - local_len)
-        local_tensor = torch.frombuffer(padded, dtype=torch.uint8).to(device, copy=True)
-        gathered = [torch.zeros(max_len, dtype=torch.uint8, device=device) for _ in range(self.world_size)]
-        dist.all_gather(gathered, local_tensor, group=self._group)
-
-        results = []
-        for t, length_t in zip(gathered, len_list):
-            length = int(length_t.item())
-            raw = bytes(t[:length].cpu().numpy())
-            results.append(raw.decode("utf-8"))
-        return results
-
-    def broadcast_scalar(self, value: Any, root: int) -> Any:
-        obj = [value if self.rank == root else None]
-        dist.broadcast_object_list(obj, src=root, group=self._group)
-        return obj[0]
-
-    def broadcast_tensor(self, value: Any, root: int) -> np.ndarray:
-        if self.rank == root:
-            tensor = torch.as_tensor(value)
-            metadata = [tensor.shape, tensor.dtype]
-        else:
-            metadata = [None, None]
-            tensor = None
-
-        dist.broadcast_object_list(metadata, src=root, group=self._group)
-        shape, dtype = metadata
-
-        if self.rank != root:
-            tensor = torch.empty(shape, dtype=dtype)
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        tensor = tensor.to(device)
-        dist.broadcast(tensor, src=root, group=self._group)
-        return tensor.cpu().numpy()
+    def broadcast_object_list(self, obj_list: list, src: int) -> None:
+        dist.broadcast_object_list(obj_list, src=src, group=self._group)
 
     def barrier(self) -> None:
         dist.barrier(group=self._group)
-
-    def all_gather_cuda(self, tensor_list: list, tensor: torch.Tensor) -> None:
-        dist.all_gather(tensor_list, tensor, group=self._group)
 
     def send(self, tensor: torch.Tensor, dst: int) -> None:
         dist.send(tensor, dst=dst, group=self._group)
@@ -217,7 +160,8 @@ class GlooBackend:
 
         if self.rank not in group_ranks:
             raise RuntimeError(
-                f"Rank {self.rank} is not part of the specified process group. Group contains ranks: {group_ranks}"
+                f"Rank {self.rank} is not part of the specified process group. "
+                f"Group contains ranks: {group_ranks}"
             )
 
         rank_in_group = group_ranks.index(self.rank)
@@ -226,77 +170,44 @@ class GlooBackend:
             strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
             if not all(s == strides[0] for s in strides):
                 raise NotImplementedError(
-                    f"Non-strided process groups are not yet supported. Group ranks: {group_ranks}."
+                    f"Non-strided process groups are not yet supported. "
+                    f"Group ranks: {group_ranks}."
                 )
             rank_start = group_ranks[0]
             rank_stride = strides[0]
             if rank_stride == 0:
-                raise ValueError(f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}.")
+                raise ValueError(
+                    f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}."
+                )
         else:
             rank_start = group_ranks[0]
             rank_stride = 1
 
         return rank_in_group, self.rank, world_size, rank_start, rank_stride
 
-    def allgather(self, data: np.ndarray) -> np.ndarray:
-        data = np.asarray(data)
-        data_tensor = torch.from_numpy(data)
-        if data_tensor.dtype == torch.uint64:
-            obj_list = [None for _ in range(self.world_size)]
-            dist.all_gather_object(obj_list, data, group=self._group)
-            return np.stack(obj_list, axis=0)
-        gathered = [torch.empty_like(data_tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered, data_tensor, group=self._group)
-        return torch.stack(gathered, dim=0).numpy()
+    def all_gather(self, tensor_list: list, tensor: torch.Tensor) -> None:
+        cpu_list = [t.cpu() for t in tensor_list]
+        cpu_tensor = tensor.cpu() if tensor.is_cuda else tensor
+        dist.all_gather(cpu_list, cpu_tensor, group=self._group)
+        for i, t in enumerate(cpu_list):
+            if tensor_list[i].is_cuda:
+                tensor_list[i].copy_(t.cuda())
+            else:
+                tensor_list[i].copy_(t)
 
-    def allgather_multidim(self, data: np.ndarray) -> np.ndarray:
-        input_tensor = torch.as_tensor(data)
-        if input_tensor.is_cuda:
-            input_tensor = input_tensor.cpu()
-        tensor_list = [torch.empty_like(input_tensor) for _ in range(self.world_size)]
-        dist.all_gather(tensor_list, input_tensor, group=self._group)
-        stacked = torch.stack(tensor_list, dim=0).view(self.world_size, -1)
-        return stacked.numpy()
-
-    def allgather_strings(self, local_string: str) -> List[str]:
-        obj_list = [None for _ in range(self.world_size)]
-        dist.all_gather_object(obj_list, local_string, group=self._group)
-        return obj_list
-
-    def broadcast_scalar(self, value: Any, root: int) -> Any:
-        obj = [value if self.rank == root else None]
-        dist.broadcast_object_list(obj, src=root, group=self._group)
-        return obj[0]
-
-    def broadcast_tensor(self, value: Any, root: int) -> np.ndarray:
-        if self.rank == root:
-            tensor = torch.as_tensor(value)
-            metadata = [tensor.shape, tensor.dtype]
-        else:
-            metadata = [None, None]
-            tensor = None
-
-        dist.broadcast_object_list(metadata, src=root, group=self._group)
-        shape, dtype = metadata
-
-        if self.rank != root:
-            tensor = torch.empty(shape, dtype=dtype)
-
+    def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         if tensor.is_cuda:
-            tensor = tensor.cpu()
+            cpu_tensor = tensor.cpu()
+            dist.broadcast(cpu_tensor, src=src, group=self._group)
+            tensor.copy_(cpu_tensor.cuda())
+        else:
+            dist.broadcast(tensor, src=src, group=self._group)
 
-        dist.broadcast(tensor, src=root, group=self._group)
-        return tensor.numpy()
+    def broadcast_object_list(self, obj_list: list, src: int) -> None:
+        dist.broadcast_object_list(obj_list, src=src, group=self._group)
 
     def barrier(self) -> None:
         dist.barrier(group=self._group)
-
-    def all_gather_cuda(self, tensor_list: list, tensor: torch.Tensor) -> None:
-        cpu_list = [t.cpu() for t in tensor_list]
-        cpu_tensor = tensor.cpu()
-        dist.all_gather(cpu_list, cpu_tensor, group=self._group)
-        for i, t in enumerate(cpu_list):
-            tensor_list[i].copy_(t.cuda())
 
     def send(self, tensor: torch.Tensor, dst: int) -> None:
         cpu_tensor = tensor.cpu()

@@ -788,12 +788,30 @@ class IrisGluon:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = self.dist.broadcast_scalar(is_tensor, src_rank)
+        obj = [is_tensor]
+        self.dist.broadcast_object_list(obj, src_rank)
+        is_tensor = obj[0]
 
         if is_tensor:
-            return self.dist.broadcast_tensor(data, root=src_rank)
+            # Broadcast tensor: first share metadata, then the data
+            if self.cur_rank == src_rank:
+                tensor = torch.as_tensor(data)
+                metadata = [tensor.shape, tensor.dtype]
+            else:
+                metadata = [None, None]
+                tensor = None
+            self.dist.broadcast_object_list(metadata, src_rank)
+            shape, dtype = metadata
+            if self.cur_rank != src_rank:
+                tensor = torch.empty(shape, dtype=dtype)
+            device = torch.device("cuda", torch.cuda.current_device())
+            tensor = tensor.to(device)
+            self.dist.broadcast(tensor, src_rank)
+            return tensor.cpu().numpy()
         else:
-            return self.dist.broadcast_scalar(data, src_rank)
+            obj = [data if self.cur_rank == src_rank else None]
+            self.dist.broadcast_object_list(obj, src_rank)
+            return obj[0]
 
     def zeros(
         self,

@@ -1045,7 +1045,13 @@ def _all_gather_strings(local_string: str, dist_backend) -> List[str]:
     """
     All-gather a string from each rank using the provided DistBackend.
     """
-    return dist_backend.allgather_strings(local_string)
+    obj_list = [None] * dist_backend.world_size
+    obj_list[dist_backend.rank] = local_string
+    for r in range(dist_backend.world_size):
+        obj = [local_string if r == dist_backend.rank else None]
+        dist_backend.broadcast_object_list(obj, src=r)
+        obj_list[r] = obj[0]
+    return obj_list
 
 
 class TopologyDiscovery:

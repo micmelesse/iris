@@ -173,8 +173,10 @@ class SymmetricHeap:
 
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
-        local_base_arr = np.array([my_base], dtype=np.int64)
-        all_bases_arr = self._dist.allgather(local_base_arr).reshape(self.num_ranks).astype(np.int64)
+        local_tensor = torch.tensor([my_base], dtype=torch.int64)
+        gathered = [torch.zeros(1, dtype=torch.int64) for _ in range(self.num_ranks)]
+        self._dist.all_gather(gathered, local_tensor)
+        all_bases_arr = torch.stack(gathered).numpy().reshape(self.num_ranks).astype(np.int64)
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
         if self.num_ranks == 1 or self.fd_conns is None:
