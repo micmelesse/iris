@@ -79,8 +79,7 @@ class NCCLBackend:
 
         if self.rank not in group_ranks:
             raise RuntimeError(
-                f"Rank {self.rank} is not part of the specified process group. "
-                f"Group contains ranks: {group_ranks}"
+                f"Rank {self.rank} is not part of the specified process group. Group contains ranks: {group_ranks}"
             )
 
         rank_in_group = group_ranks.index(self.rank)
@@ -89,15 +88,12 @@ class NCCLBackend:
             strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
             if not all(s == strides[0] for s in strides):
                 raise NotImplementedError(
-                    f"Non-strided process groups are not yet supported. "
-                    f"Group ranks: {group_ranks}."
+                    f"Non-strided process groups are not yet supported. Group ranks: {group_ranks}."
                 )
             rank_start = group_ranks[0]
             rank_stride = strides[0]
             if rank_stride == 0:
-                raise ValueError(
-                    f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}."
-                )
+                raise ValueError(f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}.")
         else:
             rank_start = group_ranks[0]
             rank_stride = 1
@@ -160,8 +156,7 @@ class GlooBackend:
 
         if self.rank not in group_ranks:
             raise RuntimeError(
-                f"Rank {self.rank} is not part of the specified process group. "
-                f"Group contains ranks: {group_ranks}"
+                f"Rank {self.rank} is not part of the specified process group. Group contains ranks: {group_ranks}"
             )
 
         rank_in_group = group_ranks.index(self.rank)
@@ -170,15 +165,12 @@ class GlooBackend:
             strides = [group_ranks[i] - group_ranks[i - 1] for i in range(1, len(group_ranks))]
             if not all(s == strides[0] for s in strides):
                 raise NotImplementedError(
-                    f"Non-strided process groups are not yet supported. "
-                    f"Group ranks: {group_ranks}."
+                    f"Non-strided process groups are not yet supported. Group ranks: {group_ranks}."
                 )
             rank_start = group_ranks[0]
             rank_stride = strides[0]
             if rank_stride == 0:
-                raise ValueError(
-                    f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}."
-                )
+                raise ValueError(f"Invalid process group: rank_stride is 0. Group ranks: {group_ranks}.")
         else:
             rank_start = group_ranks[0]
             rank_stride = 1
