@@ -39,12 +39,7 @@ except ImportError as e:
 
 import triton.language as tl
 
-from iris._distributed_helpers import (
-    init_distributed,
-    distributed_barrier,
-    distributed_broadcast_scalar,
-    distributed_broadcast_tensor,
-)
+from iris.dist_backend import init_distributed, NCCLBackend
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -500,14 +495,17 @@ class IrisGluon:
         self.heap_size = heap_size
         self.device = f"cuda:{gpu_id}"
 
+        # Distributed backend for all external collective ops.
+        self.dist = NCCLBackend()
+
         # Initialize symmetric heap
-        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks)
+        self.heap = SymmetricHeap(heap_size, gpu_id, cur_rank, num_ranks, dist_backend=self.dist)
         self.heap_bases = self.heap.get_heap_bases()
 
         for i in range(num_ranks):
             self.debug(f"GPU {i}: Heap base {hex(int(self.heap_bases[i].item()))}")
 
-        distributed_barrier()
+        self.dist.barrier()
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
@@ -711,7 +709,7 @@ class IrisGluon:
             group (ProcessGroup, optional): The process group to synchronize.
                 If None, uses the default process group (all ranks).
         """
-        distributed_barrier(group=group)
+        self.dist.barrier()
 
     def get_device(self):
         """
@@ -792,12 +790,12 @@ class IrisGluon:
             is_tensor = False
 
         # Broadcast the type decision to all ranks
-        is_tensor = distributed_broadcast_scalar(is_tensor, src_rank)
+        is_tensor = self.dist.broadcast_scalar(is_tensor, src_rank)
 
         if is_tensor:
-            return distributed_broadcast_tensor(data, root=src_rank)
+            return self.dist.broadcast_tensor(data, root=src_rank)
         else:
-            return distributed_broadcast_scalar(data, src_rank)
+            return self.dist.broadcast_scalar(data, src_rank)
 
     def zeros(
         self,

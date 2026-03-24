@@ -380,4 +380,4 @@ def all_gather(
     )
 
     if not async_op:
-        shmem._dist.ccl_barrier(shmem)
+        shmem.barrier()

@@ -42,11 +42,7 @@ import triton
 import triton.language as tl
 from triton.language.core import _aggregate as aggregate
 
-from iris._distributed_helpers import (
-    init_distributed,
-    distributed_device_barrier,
-)
-from iris.dist_backend import NCCLBackend, GlooBackend
+from iris.dist_backend import init_distributed, distributed_device_barrier, NCCLBackend, GlooBackend
 from iris.hip import (
     set_device,
     get_cu_count,
@@ -975,9 +971,8 @@ class Iris:
         """
         Synchronize ranks within the specified group and their CUDA devices.
 
-        This first calls ``torch.cuda.synchronize()`` or ``stream.synchronize()`` to ensure the local GPU has
-        finished all queued work, then performs a distributed barrier so that all
-        ranks in the group reach the same point before proceeding.
+        When using GlooBackend, dispatches to device_barrier() which is CUDA
+        graph capturable. Otherwise uses host-side sync + distributed barrier.
 
         Args:
             stream: If stream is given: wait only for that stream before barrier. If stream is None: legacy behavior (device-wide sync).
@@ -989,13 +984,16 @@ class Iris:
             >>> ctx.barrier()  # Synchronize all ranks
             >>> ctx.barrier(group=my_group)  # Synchronize only ranks in my_group
         """
-        # Wait for all GPUs to finish work
+        if isinstance(self.dist, GlooBackend):
+            self.device_barrier()
+            return
+
+        # Host-side path: sync GPU then distributed barrier
         if stream is None:
             torch.cuda.synchronize()
         else:
             stream.synchronize()
 
-        # Distributed barrier
         self.dist.barrier()
 
     def device_barrier(self, group=None):
