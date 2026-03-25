@@ -374,7 +374,7 @@ class IrisDeviceCtx:
         return translated_ptr
 
     @gluon.jit
-    def load(self, pointer, from_rank, mask=None, other=None):
+    def load(self, pointer, from_rank, mask=None, other=None, cache_modifier=None, volatile=False):
         """
         Loads a value from the specified rank's memory location to the current rank.
 
@@ -383,6 +383,17 @@ class IrisDeviceCtx:
             from_rank: The rank ID from which to read the data
             mask: Optional mask for conditional loading
             other: Value to return for masked-out elements. If not provided, the result for masked-out elements is undefined.
+            cache_modifier (str, optional): Controls cache behavior of the load.
+
+                Supported values:
+                    - None: *(default)* — Same as ".ca". Uses cache at all levels (CU, L2, LLC) with LRU policy.
+                    - ".ca": Cache at all levels (CU, L2, LLC) with LRU policy.
+                    - ".cg": Bypasses the CU (L1) cache, streams through L2, and may hit in LLC but the line is not retained or inserted.
+                    - ".cv": Bypasses all GPU caches (CU and L2) and fetches directly from system memory. If data exists in the LLC, it may hit, but is not retained or inserted.
+                            Ensures global coherence by invalidating stale GPU cache lines.
+
+            volatile (bool, optional): If True, disables compiler optimizations that
+                could reorder or eliminate the load. Defaults to False.
 
         Returns:
             The loaded value from the target memory location
@@ -392,11 +403,11 @@ class IrisDeviceCtx:
             >>> data = ctx.load(buffer + offsets, 1, mask=mask)
         """
         translated_ptr = self._translate(pointer, self.cur_rank, from_rank)
-        result = gl.load(translated_ptr, mask=mask, other=other)
+        result = gl.load(translated_ptr, mask=mask, other=other, cache_modifier=cache_modifier, volatile=volatile)
         return result
 
     @gluon.jit
-    def store(self, pointer, value, to_rank, mask=None):
+    def store(self, pointer, value, to_rank, mask=None, cache_modifier=None):
         """
         Writes data from the current rank to the specified rank's memory location.
 
@@ -405,16 +416,25 @@ class IrisDeviceCtx:
             value: The value to store
             to_rank: The rank ID to which the data will be written
             mask: Optional mask for conditional storing
+            cache_modifier (str, optional): Controls cache behavior of the store. Supported values are:
+
+                - None: *(default)* — Same as ".wb". Uses write-back caching at all levels (CU, L2, LLC) with LRU policy.
+                - ".wb": Write-back. Write-allocate on L1 miss, inserted into caches and written back later.
+                - ".cg": Cache Global. Equivalent to ".wb" — stored through L1 → L2 → LLC under LRU.
+                - ".cs": Cache Streaming. Bypasses L1, streamed through L2, not retained in LLC.
+                - ".wt": Write-Through. Bypasses L1 and L2 (coherent cache bypass), may hit in LLC with LRU.
 
         Example:
             >>> # Store from current rank to rank 1
             >>> ctx.store(buffer + offsets, values, 1, mask=mask)
         """
         translated_ptr = self._translate(pointer, self.cur_rank, to_rank)
-        gl.store(translated_ptr, value, mask=mask)
+        gl.store(translated_ptr, value, mask=mask, cache_modifier=cache_modifier)
 
     @gluon.jit
-    def get(self, from_ptr, to_ptr, from_rank, mask=None, other=None):
+    def get(
+        self, from_ptr, to_ptr, from_rank, mask=None, other=None, load_cache_modifier=None, store_cache_modifier=None
+    ):
         """
         Copies data from the specified rank's memory to the current rank's local memory.
 
@@ -424,17 +444,31 @@ class IrisDeviceCtx:
             from_rank: The rank ID from which to read the data
             mask: Optional mask for conditional operations
             other: Value to return for masked-out elements during the load operation. If not provided, the result for masked-out elements is undefined.
+            load_cache_modifier (str, optional): Controls cache behavior of the load. Supported values are:
+                - None: *(default)* — Same as ".ca". Uses cache at all levels (CU, L2, LLC) with LRU policy.
+                - ".ca": Cache at all levels (CU, L2, LLC) with LRU policy.
+                - ".cg": Bypasses the CU (L1) cache, streams through L2, and may hit in LLC but the line is not retained or inserted.
+                - ".cv": Bypasses all GPU caches (CU and L2) and fetches directly from system memory. If data exists in the LLC, it may hit, but is not retained or inserted.
+
+            store_cache_modifier (str, optional): Controls cache behavior of the store. Supported values are:
+                - None: *(default)* — Same as ".wb". Uses write-back caching at all levels (CU, L2, LLC) with LRU policy.
+                - ".wb": Write-back. Write-allocate on L1 miss, inserted into caches and written back later.
+                - ".cg": Cache Global. Equivalent to ".wb" — stored through L1 → L2 → LLC under LRU.
+                - ".cs": Cache Streaming. Bypasses L1, streamed through L2, not retained in LLC.
+                - ".wt": Write-Through. Bypasses L1 and L2 (coherent cache bypass), may hit in LLC with LRU.
 
         Example:
             >>> # Copy from rank 1 to current rank's local memory
             >>> ctx.get(remote_ptr + offsets, local_ptr + offsets, 1, mask=mask)
         """
         translated_from_ptr = self._translate(from_ptr, self.cur_rank, from_rank)
-        data = gl.load(translated_from_ptr, mask=mask, other=other)
-        gl.store(to_ptr, data, mask=mask)
+        data = gl.load(translated_from_ptr, mask=mask, other=other, cache_modifier=load_cache_modifier)
+        gl.store(to_ptr, data, mask=mask, cache_modifier=store_cache_modifier)
 
     @gluon.jit
-    def put(self, from_ptr, to_ptr, to_rank, mask=None, other=None):
+    def put(
+        self, from_ptr, to_ptr, to_rank, mask=None, other=None, load_cache_modifier=None, store_cache_modifier=None
+    ):
         """
         Copies data from the current rank's local memory to the specified rank's memory.
 
@@ -444,17 +478,39 @@ class IrisDeviceCtx:
             to_rank: The rank ID to which the data will be written
             mask: Optional mask for conditional operations
             other: Value to return for masked-out elements during the load operation. If not provided, the result for masked-out elements is undefined.
+            load_cache_modifier (str, optional): Controls cache behavior of the load. Supported values are:
+                - None: *(default)* — Same as ".ca". Uses cache at all levels (CU, L2, LLC) with LRU policy.
+                - ".ca": Cache at all levels (CU, L2, LLC) with LRU policy.
+                - ".cg": Bypasses the CU (L1) cache, streams through L2, and may hit in LLC but the line is not retained or inserted.
+                - ".cv": Bypasses all GPU caches (CU and L2) and fetches directly from system memory. If data exists in the LLC, it may hit, but is not retained or inserted.
+
+            store_cache_modifier (str, optional): Controls cache behavior of the store. Supported values are:
+                - None: *(default)* — Same as ".wb". Uses write-back caching at all levels (CU, L2, LLC) with LRU policy.
+                - ".wb": Write-back. Write-allocate on L1 miss, inserted into caches and written back later.
+                - ".cg": Cache Global. Equivalent to ".wb" — stored through L1 → L2 → LLC under LRU.
+                - ".cs": Cache Streaming. Bypasses L1, streamed through L2, not retained in LLC.
+                - ".wt": Write-Through. Bypasses L1 and L2 (coherent cache bypass), may hit in LLC with LRU.
 
         Example:
             >>> # Copy from current rank's local memory to rank 1
             >>> ctx.put(local_ptr + offsets, remote_ptr + offsets, 1, mask=mask)
         """
         translated_to_ptr = self._translate(to_ptr, self.cur_rank, to_rank)
-        data = gl.load(from_ptr, mask=mask, other=other)
-        gl.store(translated_to_ptr, data, mask=mask)
+        data = gl.load(from_ptr, mask=mask, other=other, cache_modifier=load_cache_modifier)
+        gl.store(translated_to_ptr, data, mask=mask, cache_modifier=store_cache_modifier)
 
     @gluon.jit
-    def copy(self, src_ptr, dst_ptr, from_rank, to_rank, mask=None, other=None):
+    def copy(
+        self,
+        src_ptr,
+        dst_ptr,
+        from_rank,
+        to_rank,
+        mask=None,
+        other=None,
+        load_cache_modifier=None,
+        store_cache_modifier=None,
+    ):
         """
         Copies data from the specified rank's memory into the destination rank's memory.
 
@@ -471,6 +527,18 @@ class IrisDeviceCtx:
             to_rank: The rank ID that will receive the data (destination rank)
             mask: Optional mask for conditional operations
             other: Value to return for masked-out elements during the load operation. If not provided, the result for masked-out elements is undefined.
+            load_cache_modifier (str, optional): Controls cache behavior of the load. Supported values are:
+                - None: *(default)* — Same as ".ca". Uses cache at all levels (CU, L2, LLC) with LRU policy.
+                - ".ca": Cache at all levels (CU, L2, LLC) with LRU policy.
+                - ".cg": Bypasses the CU (L1) cache, streams through L2, and may hit in LLC but the line is not retained or inserted.
+                - ".cv": Bypasses all GPU caches (CU and L2) and fetches directly from system memory. If data exists in the LLC, it may hit, but is not retained or inserted.
+
+            store_cache_modifier (str, optional): Controls cache behavior of the store. Supported values are:
+                - None: *(default)* — Same as ".wb". Uses write-back caching at all levels (CU, L2, LLC) with LRU policy.
+                - ".wb": Write-back. Write-allocate on L1 miss, inserted into caches and written back later.
+                - ".cg": Cache Global. Equivalent to ".wb" — stored through L1 → L2 → LLC under LRU.
+                - ".cs": Cache Streaming. Bypasses L1, streamed through L2, not retained in LLC.
+                - ".wt": Write-Through. Bypasses L1 and L2 (coherent cache bypass), may hit in LLC with LRU.
 
         Example:
             >>> # Copy from rank 1 to rank 0 (current rank must be either 1 or 0)
@@ -492,8 +560,8 @@ class IrisDeviceCtx:
         translated_src = tl.cast(from_base_byte + src_offset, src_ptr.dtype)
         translated_dst = tl.cast(to_base_byte + dst_offset, src_ptr.dtype)
 
-        data = gl.load(translated_src, mask=mask, other=other)
-        gl.store(translated_dst, data, mask=mask)
+        data = gl.load(translated_src, mask=mask, other=other, cache_modifier=load_cache_modifier)
+        gl.store(translated_dst, data, mask=mask, cache_modifier=store_cache_modifier)
 
     @gluon.jit
     def atomic_add(self, pointer, val, to_rank, mask=None, sem=None, scope=None):
