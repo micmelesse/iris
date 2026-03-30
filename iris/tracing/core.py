@@ -250,7 +250,7 @@ class Tracing:
         self.iris.dist.all_gather(all_event_counts, event_counts)
 
         # Synchronize before point-to-point communication to ensure proper ordering
-        self.iris.dist.barrier()
+        self.iris.dist.host_barrier()
 
         # Rank 0: gather and merge all events
         if self.iris.cur_rank == 0:

@@ -166,8 +166,8 @@ def setup_fd_infrastructure(cur_rank: int, num_ranks: int, dist_backend=None):
         obj = [my_path if r == cur_rank else None]
         dist_backend.broadcast_object_list(obj, src=r)
         all_paths[r] = obj[0]
-    dist_backend.barrier()
+    dist_backend.host_barrier()
     fd_conns = setup_fd_mesh(cur_rank, num_ranks, all_paths)
-    dist_backend.barrier()
+    dist_backend.host_barrier()
 
     return fd_conns

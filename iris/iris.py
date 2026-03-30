@@ -129,7 +129,9 @@ class Iris:
                 )
 
         self._device_barrier_state: Dict[Any, torch.Tensor] = {}
-        self.dist.barrier()
+        self._heap_ready = False
+        self.dist.host_barrier()
+        self._heap_ready = True
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
@@ -981,19 +983,19 @@ class Iris:
 
     def barrier(self, stream=None):
         """
-        Synchronize ranks and their CUDA devices.
+        Synchronize all ranks.
 
-        Uses the dist backend's host-side barrier (cuda sync + dist.barrier).
-
-        Args:
-            stream: If given, wait only for that stream before barrier.
-                If None, full device sync (legacy behavior).
-
-        Example:
-            >>> ctx = iris.iris(1 << 20)
-            >>> ctx.barrier()  # Synchronize all ranks
+        Routes to device_barrier (GPU-side, graph-capturable) when the heap
+        is ready, host_barrier (CPU-side) otherwise.
         """
-        self.dist.barrier(stream)
+        if self._heap_ready:
+            self.device_barrier()
+        else:
+            self.host_barrier(stream)
+
+    def host_barrier(self, stream=None):
+        """Host-side barrier via the dist backend (cuda sync + dist.barrier)."""
+        self.dist.host_barrier(stream)
 
     def device_barrier(self, group=None):
         """

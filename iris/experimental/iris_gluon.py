@@ -503,7 +503,7 @@ class IrisGluon:
         for i in range(num_ranks):
             self.debug(f"GPU {i}: Heap base {hex(int(self.heap_bases[i].item()))}")
 
-        self.dist.barrier()
+        self.dist.host_barrier()
 
         # Initialize CCL interface
         self.ccl = self.CCL(self)
@@ -707,7 +707,7 @@ class IrisGluon:
             group (ProcessGroup, optional): The process group to synchronize.
                 If None, uses the default process group (all ranks).
         """
-        self.dist.barrier()
+        self.dist.host_barrier()
 
     def get_device(self):
         """

@@ -45,7 +45,7 @@ class DistBackend(Protocol):
 
     def broadcast_object_list(self, obj_list: list, src: int) -> None: ...
 
-    def barrier(self, stream=None) -> None: ...
+    def host_barrier(self, stream=None) -> None: ...
 
     def send(self, tensor: torch.Tensor, dst: int) -> None: ...
 
@@ -113,7 +113,7 @@ class NCCLBackend:
     def broadcast_object_list(self, obj_list: list, src: int) -> None:
         dist.broadcast_object_list(obj_list, src=src, group=self._group)
 
-    def barrier(self, stream=None) -> None:
+    def host_barrier(self, stream=None) -> None:
         if stream is None:
             torch.cuda.synchronize()
         else:
@@ -206,7 +206,7 @@ class GlooBackend:
     def broadcast_object_list(self, obj_list: list, src: int) -> None:
         dist.broadcast_object_list(obj_list, src=src, group=self._group)
 
-    def barrier(self, stream=None) -> None:
+    def host_barrier(self, stream=None) -> None:
         dist.barrier(group=self._group)
 
     def send(self, tensor: torch.Tensor, dst: int) -> None:

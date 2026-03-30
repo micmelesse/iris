@@ -169,7 +169,7 @@ class SymmetricHeap:
         )
 
         if self._dist is not None:
-            self._dist.barrier()
+            self._dist.host_barrier()
 
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
@@ -274,7 +274,7 @@ class SymmetricHeap:
             os.close(fd)
 
         if self._dist is not None:
-            self._dist.barrier()
+            self._dist.host_barrier()
 
     def as_symmetric(self, external_tensor: torch.Tensor) -> torch.Tensor:
         """
