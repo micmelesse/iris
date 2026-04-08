@@ -230,9 +230,10 @@ class SymmetricHeap:
         access_desc.location.id = self.device_id
         access_desc.flags = hipMemAccessFlagsProtReadWrite
 
-        for peer, sock in self.fd_conns.items():
+        for peer in sorted(self.fd_conns):
             if peer == self.cur_rank:
                 continue
+            sock = self.fd_conns[peer]
 
             _rlog(f"peer={peer} va_reserve")
             if not hasattr(self, "_peer_va_ranges"):
