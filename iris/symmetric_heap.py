@@ -64,6 +64,7 @@ class SymmetricHeap:
             raise ValueError(f"Unknown allocator type: {allocator_type}. Supported: 'torch', 'vmem'")
 
         import sys
+
         def _log(msg):
             print(f"[heap rank={cur_rank} dev={device_id}] {msg}", file=sys.stderr, flush=True)
 

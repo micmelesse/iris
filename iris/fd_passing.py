@@ -155,6 +155,7 @@ def setup_fd_infrastructure(cur_rank: int, num_ranks: int, dist_backend=None):
         Dictionary mapping peer rank -> socket, or None for single rank
     """
     import sys
+
     def _log(msg):
         print(f"[fd rank={cur_rank}] {msg}", file=sys.stderr, flush=True)
 
