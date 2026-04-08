@@ -154,6 +154,10 @@ def setup_fd_infrastructure(cur_rank: int, num_ranks: int, dist_backend=None):
     Returns:
         Dictionary mapping peer rank -> socket, or None for single rank
     """
+    import sys
+    def _log(msg):
+        print(f"[fd rank={cur_rank}] {msg}", file=sys.stderr, flush=True)
+
     if num_ranks <= 1:
         return None
 
@@ -163,11 +167,16 @@ def setup_fd_infrastructure(cur_rank: int, num_ranks: int, dist_backend=None):
     # Gather socket paths from all ranks (strings, not tensors)
     all_paths = {}
     for r in range(num_ranks):
+        _log(f"broadcast_object_list src={r}")
         obj = [my_path if r == cur_rank else None]
         dist_backend.broadcast_object_list(obj, src=r)
         all_paths[r] = obj[0]
+    _log("host_barrier before setup_fd_mesh")
     dist_backend.host_barrier()
+    _log("setup_fd_mesh")
     fd_conns = setup_fd_mesh(cur_rank, num_ranks, all_paths)
+    _log("host_barrier after setup_fd_mesh")
     dist_backend.host_barrier()
+    _log("fd_infrastructure done")
 
     return fd_conns

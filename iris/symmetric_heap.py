@@ -63,7 +63,13 @@ class SymmetricHeap:
         else:
             raise ValueError(f"Unknown allocator type: {allocator_type}. Supported: 'torch', 'vmem'")
 
+        import sys
+        def _log(msg):
+            print(f"[heap rank={cur_rank} dev={device_id}] {msg}", file=sys.stderr, flush=True)
+
+        _log("setup_fd_infrastructure")
         self.fd_conns = setup_fd_infrastructure(cur_rank, num_ranks, dist_backend=dist_backend)
+        _log("setup_fd_infrastructure done")
         device = self.allocator.get_device()
 
         # Use int64 instead of uint64 for gloo backend compatibility
@@ -78,7 +84,9 @@ class SymmetricHeap:
         else:
             self.heap_bases = torch.tensor(heap_bases_array, device=device, dtype=torch.int64)
 
+        _log("refresh_peer_access")
         self.refresh_peer_access()
+        _log("refresh_peer_access done")
 
     def allocate(self, num_elements: int, dtype: torch.dtype, alignment: int = 1024) -> torch.Tensor:
         """
