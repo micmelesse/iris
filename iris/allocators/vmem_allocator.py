@@ -118,17 +118,20 @@ class VMemAllocator(BaseAllocator):
 
     def get_allocation_segments(self):
         """
-        Get list of allocation segments for segmented DMA-BUF export.
+        Get list of allocation segments for VMem export.
 
         Returns:
-            List of (offset, size, va) tuples for each allocation in order.
+            List of (offset, size, handle) tuples for each allocation in order.
             Each tuple describes one physically-backed segment that needs
-            to be exported/imported separately.
+            to be exported/imported separately. The handle is the VMem
+            allocation handle from mem_create, used with
+            hipMemExportToShareableHandle/hipMemImportFromShareableHandle.
         """
         segments = []
         for offset, size in self.allocation_order:
-            va = self.base_va + offset
-            segments.append((offset, size, va))
+            alloc_info = self.allocations[offset]
+            handle = alloc_info[2]  # (size, is_imported, handle, va)
+            segments.append((offset, size, handle))
         return segments
 
     def get_minimum_allocation_size(self) -> int:

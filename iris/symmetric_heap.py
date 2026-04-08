@@ -167,7 +167,7 @@ class SymmetricHeap:
         """
         from iris.fd_passing import send_fd, recv_fd
         from iris.hip import (
-            export_dmabuf_handle,
+            mem_export_to_shareable_handle,
             mem_import_from_shareable_handle,
             mem_map,
             mem_set_access,
@@ -217,13 +217,13 @@ class SymmetricHeap:
             return
 
         my_segments = self.allocator.get_allocation_segments()
-        _rlog(f"export_dmabuf_handle segments={len(my_segments)}")
+        _rlog(f"export segments={len(my_segments)}")
         my_exported_fds = []
-        for offset, size, va in my_segments:
-            _rlog(f"export_dmabuf va={va:#x} size={size}")
-            dmabuf_fd, export_base, export_size = export_dmabuf_handle(va, size)
-            _rlog(f"export_dmabuf -> fd={dmabuf_fd} export_size={export_size}")
-            my_exported_fds.append((dmabuf_fd, export_size, offset))
+        for offset, size, handle in my_segments:
+            _rlog(f"mem_export_to_shareable_handle offset={offset} size={size}")
+            fd = mem_export_to_shareable_handle(handle)
+            _rlog(f"mem_export_to_shareable_handle -> fd={fd}")
+            my_exported_fds.append((fd, size, offset))
 
         access_desc = hipMemAccessDesc()
         access_desc.location.type = hipMemLocationTypeDevice
