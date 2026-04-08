@@ -177,14 +177,22 @@ class SymmetricHeap:
             hipMemAccessFlagsProtReadWrite,
         )
 
+        import sys
+        def _rlog(msg):
+            print(f"[refresh rank={self.cur_rank} dev={self.device_id}] {msg}", file=sys.stderr, flush=True)
+
+        _rlog("host_barrier 1")
         if self._dist is not None:
             self._dist.host_barrier()
+        _rlog("host_barrier 1 done")
 
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
         local_tensor = torch.tensor([my_base], dtype=torch.int64)
         gathered = [torch.zeros(1, dtype=torch.int64) for _ in range(self.num_ranks)]
+        _rlog("all_gather")
         self._dist.all_gather(gathered, local_tensor)
+        _rlog("all_gather done")
         all_bases_arr = torch.stack(gathered).numpy().reshape(self.num_ranks).astype(np.int64)
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
@@ -208,9 +216,12 @@ class SymmetricHeap:
             return
 
         my_segments = self.allocator.get_allocation_segments()
+        _rlog(f"export_dmabuf_handle segments={len(my_segments)}")
         my_exported_fds = []
         for offset, size, va in my_segments:
+            _rlog(f"export_dmabuf va={va:#x} size={size}")
             dmabuf_fd, export_base, export_size = export_dmabuf_handle(va, size)
+            _rlog(f"export_dmabuf -> fd={dmabuf_fd} export_size={export_size}")
             my_exported_fds.append((dmabuf_fd, export_size, offset))
 
         access_desc = hipMemAccessDesc()
@@ -222,6 +233,7 @@ class SymmetricHeap:
             if peer == self.cur_rank:
                 continue
 
+            _rlog(f"peer={peer} va_reserve")
             if not hasattr(self, "_peer_va_ranges"):
                 self._peer_va_ranges = {}
 
@@ -230,9 +242,11 @@ class SymmetricHeap:
                 self._peer_va_ranges[peer] = peer_va_base
             else:
                 peer_va_base = self._peer_va_ranges[peer]
+            _rlog(f"peer={peer} va_base={peer_va_base:#x}")
 
             peer_fds = []
             for seg_idx, (my_fd, my_size, my_offset) in enumerate(my_exported_fds):
+                _rlog(f"peer={peer} fd_exchange seg={seg_idx}")
                 # Exchange FDs (higher rank sends first to avoid deadlock)
                 if self.cur_rank > peer:
                     send_fd(sock, my_fd)
@@ -240,6 +254,7 @@ class SymmetricHeap:
                 else:
                     peer_fd, _ = recv_fd(sock)
                     send_fd(sock, my_fd)
+                _rlog(f"peer={peer} fd_exchange done peer_fd={peer_fd}")
 
                 peer_fds.append((peer_fd, my_size, my_offset))
 
@@ -260,19 +275,24 @@ class SymmetricHeap:
                     os.close(peer_fd)
                     continue
 
+                _rlog(f"peer={peer} mem_import fd={peer_fd}")
                 imported_handle = mem_import_from_shareable_handle(peer_fd)
                 import os
 
                 os.close(peer_fd)
 
                 peer_va = peer_va_base + offset
+                _rlog(f"peer={peer} mem_map va={peer_va:#x} size={segment_size}")
                 mem_map(peer_va, segment_size, 0, imported_handle)
+
                 self._peer_imported_segments[peer].add(segment_key)
 
                 new_cumulative = offset + segment_size
                 if new_cumulative > cumulative_size:
                     cumulative_size = new_cumulative
+                    _rlog(f"peer={peer} mem_set_access va={peer_va_base:#x} size={cumulative_size}")
                     mem_set_access(peer_va_base, cumulative_size, access_desc)
+                    _rlog(f"peer={peer} mem_set_access done")
 
             self._peer_cumulative_sizes[peer] = cumulative_size
             self.heap_bases[peer] = peer_va_base
@@ -282,8 +302,10 @@ class SymmetricHeap:
 
             os.close(fd)
 
+        _rlog("host_barrier 2")
         if self._dist is not None:
             self._dist.host_barrier()
+        _rlog("host_barrier 2 done")
 
     def as_symmetric(self, external_tensor: torch.Tensor) -> torch.Tensor:
         """
