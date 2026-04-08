@@ -178,6 +178,7 @@ class SymmetricHeap:
         )
 
         import sys
+
         def _rlog(msg):
             print(f"[refresh rank={self.cur_rank} dev={self.device_id}] {msg}", file=sys.stderr, flush=True)
 
