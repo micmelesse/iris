@@ -63,7 +63,14 @@ class SymmetricHeap:
         else:
             raise ValueError(f"Unknown allocator type: {allocator_type}. Supported: 'torch', 'vmem'")
 
+        import sys
+
+        def _log(msg):
+            print(f"[heap rank={cur_rank} dev={device_id}] {msg}", file=sys.stderr, flush=True)
+
+        _log("setup_fd_infrastructure")
         self.fd_conns = setup_fd_infrastructure(cur_rank, num_ranks, dist_backend=dist_backend)
+        _log("setup_fd_infrastructure done")
         device = self.allocator.get_device()
 
         # Use int64 instead of uint64 for gloo backend compatibility
@@ -78,7 +85,9 @@ class SymmetricHeap:
         else:
             self.heap_bases = torch.tensor(heap_bases_array, device=device, dtype=torch.int64)
 
+        _log("refresh_peer_access")
         self.refresh_peer_access()
+        _log("refresh_peer_access done")
 
     def allocate(self, num_elements: int, dtype: torch.dtype, alignment: int = 1024) -> torch.Tensor:
         """
@@ -158,7 +167,7 @@ class SymmetricHeap:
         """
         from iris.fd_passing import send_fd, recv_fd
         from iris.hip import (
-            export_dmabuf_handle,
+            mem_export_to_shareable_handle,
             mem_import_from_shareable_handle,
             mem_map,
             mem_set_access,
@@ -168,14 +177,23 @@ class SymmetricHeap:
             hipMemAccessFlagsProtReadWrite,
         )
 
+        import sys
+
+        def _rlog(msg):
+            print(f"[refresh rank={self.cur_rank} dev={self.device_id}] {msg}", file=sys.stderr, flush=True)
+
+        _rlog("host_barrier 1")
         if self._dist is not None:
             self._dist.host_barrier()
+        _rlog("host_barrier 1 done")
 
         my_base = self.allocator.get_base_address()
         # Use int64 instead of uint64 to avoid gloo issues with all_gather_object
         local_tensor = torch.tensor([my_base], dtype=torch.int64)
         gathered = [torch.zeros(1, dtype=torch.int64) for _ in range(self.num_ranks)]
+        _rlog("all_gather")
         self._dist.all_gather(gathered, local_tensor)
+        _rlog("all_gather done")
         all_bases_arr = torch.stack(gathered).numpy().reshape(self.num_ranks).astype(np.int64)
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
@@ -199,20 +217,25 @@ class SymmetricHeap:
             return
 
         my_segments = self.allocator.get_allocation_segments()
+        _rlog(f"export segments={len(my_segments)}")
         my_exported_fds = []
-        for offset, size, va in my_segments:
-            dmabuf_fd, export_base, export_size = export_dmabuf_handle(va, size)
-            my_exported_fds.append((dmabuf_fd, export_size, offset))
+        for offset, size, handle in my_segments:
+            _rlog(f"mem_export_to_shareable_handle offset={offset} size={size}")
+            fd = mem_export_to_shareable_handle(handle)
+            _rlog(f"mem_export_to_shareable_handle -> fd={fd}")
+            my_exported_fds.append((fd, size, offset))
 
         access_desc = hipMemAccessDesc()
         access_desc.location.type = hipMemLocationTypeDevice
         access_desc.location.id = self.device_id
         access_desc.flags = hipMemAccessFlagsProtReadWrite
 
-        for peer, sock in self.fd_conns.items():
+        for peer in sorted(self.fd_conns):
             if peer == self.cur_rank:
                 continue
+            sock = self.fd_conns[peer]
 
+            _rlog(f"peer={peer} va_reserve")
             if not hasattr(self, "_peer_va_ranges"):
                 self._peer_va_ranges = {}
 
@@ -221,9 +244,11 @@ class SymmetricHeap:
                 self._peer_va_ranges[peer] = peer_va_base
             else:
                 peer_va_base = self._peer_va_ranges[peer]
+            _rlog(f"peer={peer} va_base={peer_va_base:#x}")
 
             peer_fds = []
             for seg_idx, (my_fd, my_size, my_offset) in enumerate(my_exported_fds):
+                _rlog(f"peer={peer} fd_exchange seg={seg_idx}")
                 # Exchange FDs (higher rank sends first to avoid deadlock)
                 if self.cur_rank > peer:
                     send_fd(sock, my_fd)
@@ -231,6 +256,7 @@ class SymmetricHeap:
                 else:
                     peer_fd, _ = recv_fd(sock)
                     send_fd(sock, my_fd)
+                _rlog(f"peer={peer} fd_exchange done peer_fd={peer_fd}")
 
                 peer_fds.append((peer_fd, my_size, my_offset))
 
@@ -251,19 +277,24 @@ class SymmetricHeap:
                     os.close(peer_fd)
                     continue
 
+                _rlog(f"peer={peer} mem_import fd={peer_fd}")
                 imported_handle = mem_import_from_shareable_handle(peer_fd)
                 import os
 
                 os.close(peer_fd)
 
                 peer_va = peer_va_base + offset
+                _rlog(f"peer={peer} mem_map va={peer_va:#x} size={segment_size}")
                 mem_map(peer_va, segment_size, 0, imported_handle)
+
                 self._peer_imported_segments[peer].add(segment_key)
 
                 new_cumulative = offset + segment_size
                 if new_cumulative > cumulative_size:
                     cumulative_size = new_cumulative
+                    _rlog(f"peer={peer} mem_set_access va={peer_va_base:#x} size={cumulative_size}")
                     mem_set_access(peer_va_base, cumulative_size, access_desc)
+                    _rlog(f"peer={peer} mem_set_access done")
 
             self._peer_cumulative_sizes[peer] = cumulative_size
             self.heap_bases[peer] = peer_va_base
@@ -273,8 +304,10 @@ class SymmetricHeap:
 
             os.close(fd)
 
+        _rlog("host_barrier 2")
         if self._dist is not None:
             self._dist.host_barrier()
+        _rlog("host_barrier 2 done")
 
     def as_symmetric(self, external_tensor: torch.Tensor) -> torch.Tensor:
         """

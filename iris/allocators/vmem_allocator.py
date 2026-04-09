@@ -8,6 +8,7 @@ This allocator provides fine-grained control over virtual and physical memory,
 enabling features like memory oversubscription and on-demand paging.
 """
 
+import sys
 import torch
 import os
 from typing import Dict
@@ -59,20 +60,27 @@ class VMemAllocator(BaseAllocator):
         va_multiplier: float = 1.0,
     ):
         super().__init__(heap_size, device_id, rank, world_size)
+        self._rank = rank
         self.va_multiplier = va_multiplier
         self.device = torch.device(f"cuda:{device_id}")
         self.lock = Lock()
+        self._log(f"get_allocation_granularity dev={device_id}")
         self.granularity = get_allocation_granularity(self.device_id)
         self.aligned_heap_size = (heap_size + self.granularity - 1) & ~(self.granularity - 1)
         self.va_size = self.aligned_heap_size
+        self._log(f"mem_address_reserve va_size={self.va_size} granularity={self.granularity}")
         self.base_va = mem_address_reserve(self.va_size, self.granularity, 0)
+        self._log(f"mem_address_reserve -> base_va={self.base_va:#x}")
 
         self.minimal_size = min(2 << 20, self.aligned_heap_size // 2)
         if self.minimal_size < self.granularity:
             self.minimal_size = self.granularity
 
+        self._log(f"mem_create size={self.minimal_size} dev={self.device_id}")
         self.minimal_handle = mem_create(self.minimal_size, self.device_id)
+        self._log(f"mem_map va={self.base_va:#x} size={self.minimal_size}")
         mem_map(self.base_va, self.minimal_size, 0, self.minimal_handle)
+        self._log("mem_map done")
 
         # ROCm: mem_set_access must be called cumulatively from base_va (see rocm-systems#2667)
         self.access_descs = []
@@ -84,7 +92,9 @@ class VMemAllocator(BaseAllocator):
             self.access_descs.append(desc)
 
         self.cumulative_mapped_size = self.minimal_size
+        self._log(f"mem_set_access va={self.base_va:#x} size={self.cumulative_mapped_size} descs={world_size}")
         mem_set_access(self.base_va, self.cumulative_mapped_size, self.access_descs)
+        self._log("mem_set_access done")
 
         self.allocations: Dict[int, tuple] = {}
         self.allocation_order = []
@@ -92,6 +102,10 @@ class VMemAllocator(BaseAllocator):
         self.current_offset = self.minimal_size
 
         self.world_size = world_size
+        self._log("init complete")
+
+    def _log(self, msg):
+        print(f"[vmem rank={self._rank} dev={self.device_id}] {msg}", file=sys.stderr, flush=True)
 
     def get_base_address(self) -> int:
         """Get the base address of the heap."""
@@ -104,17 +118,20 @@ class VMemAllocator(BaseAllocator):
 
     def get_allocation_segments(self):
         """
-        Get list of allocation segments for segmented DMA-BUF export.
+        Get list of allocation segments for VMem export.
 
         Returns:
-            List of (offset, size, va) tuples for each allocation in order.
+            List of (offset, size, handle) tuples for each allocation in order.
             Each tuple describes one physically-backed segment that needs
-            to be exported/imported separately.
+            to be exported/imported separately. The handle is the VMem
+            allocation handle from mem_create, used with
+            hipMemExportToShareableHandle/hipMemImportFromShareableHandle.
         """
         segments = []
         for offset, size in self.allocation_order:
-            va = self.base_va + offset
-            segments.append((offset, size, va))
+            alloc_info = self.allocations[offset]
+            handle = alloc_info[2]  # (size, is_imported, handle, va)
+            segments.append((offset, size, handle))
         return segments
 
     def get_minimum_allocation_size(self) -> int:
@@ -153,12 +170,15 @@ class VMemAllocator(BaseAllocator):
                 )
 
             target_va = self.base_va + aligned_offset
+            self._log(f"alloc mem_create size={aligned_size} dev={self.device_id}")
             handle = mem_create(aligned_size, self.device_id)
+            self._log(f"alloc mem_map va={target_va:#x} size={aligned_size}")
             mem_map(target_va, aligned_size, 0, handle)
 
             new_cumulative_size = aligned_offset + aligned_size
             if new_cumulative_size > self.cumulative_mapped_size:
                 self.cumulative_mapped_size = new_cumulative_size
+                self._log(f"alloc mem_set_access va={self.base_va:#x} size={self.cumulative_mapped_size}")
                 mem_set_access(self.base_va, self.cumulative_mapped_size, self.access_descs)
 
             self._track_allocation(aligned_offset, aligned_size, False, handle, target_va)
@@ -255,18 +275,23 @@ class VMemAllocator(BaseAllocator):
                     f"available: {self.aligned_heap_size - aligned_offset} bytes"
                 )
 
+            self._log(f"import export_dmabuf_handle base={alloc_base:#x} size={alloc_size}")
             dmabuf_fd, export_base, export_size = export_dmabuf_handle(alloc_base, alloc_size)
             aligned_export_size = (export_size + self.granularity - 1) & ~(self.granularity - 1)
             target_va = self.base_va + aligned_offset
+            self._log(f"import mem_import fd={dmabuf_fd} export_size={export_size}")
             imported_handle = mem_import_from_shareable_handle(dmabuf_fd)
             os.close(dmabuf_fd)
 
+            self._log(f"import mem_map va={target_va:#x} size={aligned_export_size}")
             mem_map(target_va, aligned_export_size, 0, imported_handle)
 
             new_cumulative_size = aligned_offset + aligned_export_size
             if new_cumulative_size > self.cumulative_mapped_size:
                 self.cumulative_mapped_size = new_cumulative_size
+                self._log(f"import mem_set_access va={self.base_va:#x} size={self.cumulative_mapped_size}")
                 mem_set_access(self.base_va, self.cumulative_mapped_size, self.access_descs)
+            self._log("import done")
 
             tensor_va = target_va + offset_in_alloc
             self._track_allocation(aligned_offset, aligned_export_size, True, imported_handle, target_va)
