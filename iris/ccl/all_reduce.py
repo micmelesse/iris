@@ -15,6 +15,7 @@ import torch
 import iris
 from .config import Config
 from .utils import chiplet_transform_chunked, ReduceOp, extract_group_info
+from iris._distributed_helpers import _translate_ptr
 
 # Variant types
 VARIANT_ATOMIC = "atomic"
@@ -45,6 +46,10 @@ class AllReduceWorkspace:
     ring_buffer: Optional[torch.Tensor] = None
     flags: Optional[torch.Tensor] = None
     locks: Optional[torch.Tensor] = None
+    # Persistent monotonic counters on symmetric heap, one int32 slot per
+    # iris-global rank. Used by two_shot's kernel-internal end barrier.
+    # Allocate-once / never-zero — semantics match _device_barrier_state.
+    barrier_flags: Optional[torch.Tensor] = None
     num_rings: int = 1
     flags_per_tile: int = 0
     prepared: bool = False
@@ -112,7 +117,10 @@ def all_reduce_preamble(
         shmem.barrier()
 
     elif variant == VARIANT_TWO_SHOT:
-        pass
+        # Allocate persistent barrier flags once; never zero on reuse.
+        if workspace.barrier_flags is None or workspace.barrier_flags.numel() != shmem.num_ranks:
+            workspace.barrier_flags = shmem.zeros((shmem.num_ranks,), dtype=torch.int32)
+            shmem.barrier()
 
     if variant == VARIANT_SPINLOCK:
         num_pid_m = (M + config.block_size_m - 1) // config.block_size_m
@@ -592,9 +600,17 @@ def persistent_all_reduce_two_shot(
     NUM_XCDS: tl.constexpr,  # unused here but kept for signature compatibility
     CHUNK_SIZE: tl.constexpr,  # unused here but kept for signature compatibility
     DISTRIBUTION: tl.constexpr,
+    barrier_flags_ptr,
+    END_BARRIER: tl.constexpr,
 ):
     """Reduce assigned tiles for a rank and broadcast the result to all peers.
     Single kernel: unmasked fast path for full tiles, masked slow path for tails.
+
+    If END_BARRIER is True, all CTAs participate in a peer-flag handshake on
+    barrier_flags_ptr before exiting, matching the kernel-internal rendezvous
+    semantics of vLLM's cross_device_reduce_1stage barrier_at_end. Removes the
+    need for a host-side or separate-kernel barrier between AR and downstream
+    ops, and stays graph-capturable.
     """
     pid = tl.program_id(0)
 
@@ -703,6 +719,31 @@ def persistent_all_reduce_two_shot(
                         hint=(1, BLOCK_SIZE_N),
                     )
 
+    # Kernel-internal end barrier (peer-flag handshake on the symmetric heap).
+    # Each CTA bumps this rank's monotonic counter (release), then spins on
+    # each peer's counter via atomic_cas (acquire) until it reaches the
+    # post-call target. The target is rounded up to the next multiple of
+    # COMM_SMS, so every CTA on every rank waits for the same value within a
+    # call. Release-acquire on the same atomic forms a release sequence,
+    # giving acquirers visibility of all CTAs' prior stores. Relies on
+    # sequential per-stream kernel execution (no overlap of consecutive AR
+    # calls), which holds for both eager and CUDA-graph dispatch.
+    if END_BARRIER:
+        own_flag_ptr = barrier_flags_ptr + iris_rank
+        own_translated = _translate_ptr(own_flag_ptr, iris_rank, iris_rank, heap_bases)
+        old = tl.atomic_add(own_translated, 1, sem="release", scope="sys")
+        target = ((old // COMM_SMS) + 1) * COMM_SMS
+        for i in range(world_size):
+            remote_rank = rank_start + i * rank_stride
+            if remote_rank != iris_rank:
+                remote_flag_ptr = barrier_flags_ptr + remote_rank
+                remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
+                while (
+                    tl.atomic_cas(remote_translated, target, target, sem="acquire", scope="sys")
+                    < target
+                ):
+                    pass
+
 
 def all_reduce(
     output_tensor,
@@ -713,6 +754,7 @@ def all_reduce(
     async_op=False,
     config=None,
     workspace: Optional[AllReduceWorkspace] = None,
+    end_barrier: bool = False,
 ):
     """
     Internal all-reduce collective operation implementation.
@@ -732,8 +774,12 @@ def all_reduce(
             Default: ReduceOp.SUM.
         group: ProcessGroup or None. If None, uses all ranks in shmem context.
                Default: None.
-        async_op: If False, performs a barrier at the end. If True, returns immediately.
-                  Default: False.
+        async_op: If False, performs a host-side barrier at the end. If True,
+                  returns immediately. Default: False.
+        end_barrier: If True (two_shot only), fuses a kernel-internal peer-flag
+                     handshake into the AR kernel before exit. Provides the
+                     same downstream-ordering guarantee as a host barrier but
+                     is fully graph-capturable. Default: False.
         config: Config instance with kernel parameters (default: None).
                 If None, uses default Config values.
                 Set config.all_reduce_variant to choose variant: "atomic", "spinlock", "ring", "two_shot", or "one_shot"
@@ -797,6 +843,7 @@ def all_reduce(
         or (variant == VARIANT_RING and workspace.num_rings != config.all_reduce_num_rings)
         or (variant == VARIANT_RING and workspace.flags_per_tile != 1)
         or (variant == VARIANT_SPINLOCK and (workspace.locks is None))
+        or (variant == VARIANT_TWO_SHOT and workspace.barrier_flags is None)
     )
 
     if needs_prepare:
@@ -932,6 +979,11 @@ def all_reduce(
         )
 
     elif variant == VARIANT_TWO_SHOT:
+        if end_barrier and (workspace is None or workspace.barrier_flags is None):
+            raise RuntimeError(
+                "end_barrier=True for two_shot requires workspace preparation. "
+                "Call all_reduce_preamble before all_reduce."
+            )
         persistent_all_reduce_two_shot[(config.comm_sms,)](
             input_tensor,
             output_tensor,
@@ -954,6 +1006,8 @@ def all_reduce(
             config.num_xcds,
             config.chunk_size,
             config.all_reduce_distribution,
+            workspace.barrier_flags,
+            end_barrier,
             num_warps=8,
             num_stages=1,
             waves_per_eu=1,

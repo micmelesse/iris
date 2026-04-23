@@ -1218,7 +1218,15 @@ class Iris:
             )
 
         def all_reduce(
-            self, output_tensor, input_tensor, op=None, group=None, async_op=False, config=None, workspace=None
+            self,
+            output_tensor,
+            input_tensor,
+            op=None,
+            group=None,
+            async_op=False,
+            config=None,
+            workspace=None,
+            end_barrier=False,
         ):
             """
             All-reduce collective operation.
@@ -1273,6 +1281,7 @@ class Iris:
                 async_op=async_op,
                 config=config,
                 workspace=workspace,
+                end_barrier=end_barrier,
             )
 
         def reduce_scatter(self, output_tensor, input_tensor, op=None, group=None, async_op=False, config=None):
