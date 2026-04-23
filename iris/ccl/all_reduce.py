@@ -738,10 +738,7 @@ def persistent_all_reduce_two_shot(
             if remote_rank != iris_rank:
                 remote_flag_ptr = barrier_flags_ptr + remote_rank
                 remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
-                while (
-                    tl.atomic_cas(remote_translated, target, target, sem="acquire", scope="sys")
-                    < target
-                ):
+                while tl.atomic_cas(remote_translated, target, target, sem="acquire", scope="sys") < target:
                     pass
 
 
