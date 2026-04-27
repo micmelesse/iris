@@ -1218,7 +1218,14 @@ class Iris:
             )
 
         def all_reduce(
-            self, output_tensor, input_tensor, op=None, group=None, async_op=False, config=None, workspace=None
+            self,
+            output_tensor,
+            input_tensor,
+            op=None,
+            group=None,
+            async_op=False,
+            config=None,
+            workspace=None,
         ):
             """
             All-reduce collective operation.
