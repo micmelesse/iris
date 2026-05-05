@@ -51,7 +51,7 @@ def all_reduce(output_tensor, input_tensor, ctx, op=None, group=None, async_op=F
         )
 
     variant = config.all_reduce_variant.lower()
-    valid_variants = ["atomic", "spinlock", "ring", "two_shot", "one_shot"]
+    valid_variants = ["atomic", "spinlock", "ring", "two_shot", "one_shot", "one_shot_vllm"]
     if variant not in valid_variants:
         raise ValueError(f"Invalid all_reduce_variant: {variant}. Must be one of: {', '.join(valid_variants)}")
 
@@ -74,9 +74,11 @@ def all_reduce(output_tensor, input_tensor, ctx, op=None, group=None, async_op=F
     )
 
     if workspace is not None:
-        workspace.prepared = False
+        variant = getattr(config, "all_reduce_variant", "two_shot").lower()
+        if variant not in ("two_shot", "one_shot_vllm"):
+            workspace.prepared = False
 
-    if not async_op:
+    if not async_op and config.all_reduce_variant.lower() != "one_shot_vllm":
         ctx.barrier()
 
     return workspace

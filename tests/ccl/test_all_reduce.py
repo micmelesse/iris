@@ -19,6 +19,7 @@ from iris.ccl import Config
         # "ring",
         "two_shot",
         "one_shot",
+        "one_shot_vllm",
         # TODO enable these tests when support for cache-modifiers is in place.
         # "spinlock",
     ],
@@ -207,6 +208,51 @@ def test_all_reduce_spinlock_lock_too_small():
     import gc
 
     gc.collect()
+
+
+@pytest.mark.parametrize("numel", [1024, 4096, 16384, 32768, 65536, 131072])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_all_reduce_one_shot_vllm_small(numel, dtype):
+    """Test one_shot_vllm at vLLM-relevant small message sizes."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    heap_size = 2**33
+    shmem = iris.iris(heap_size)
+    rank = shmem.get_rank()
+
+    pytorch_input = torch.randn(numel, dtype=dtype, device=f"cuda:{rank}")
+    pytorch_input.fill_(float(rank + 1))
+
+    pytorch_output = pytorch_input.clone()
+    shmem.barrier()
+    dist.all_reduce(pytorch_output, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()
+
+    iris_input = shmem.zeros((1, numel), dtype=dtype)
+    iris_input.view(-1).copy_(pytorch_input)
+    iris_output = shmem.zeros((1, numel), dtype=dtype)
+
+    shmem.barrier()
+    config = Config(all_reduce_variant="one_shot_vllm")
+    workspace = shmem.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
+    shmem.barrier()
+    shmem.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
+    torch.cuda.synchronize()
+
+    atol = 1e-3 if dtype == torch.float16 else 1e-3
+    max_diff = torch.abs(iris_output.view(-1) - pytorch_output).max().item()
+
+    try:
+        assert torch.allclose(iris_output.view(-1), pytorch_output, atol=atol), (
+            f"Max difference: {max_diff}, expected < {atol}\n"
+            f"Rank {rank}: one_shot_vllm output doesn't match PyTorch (numel={numel}, dtype={dtype})"
+        )
+    finally:
+        shmem.barrier()
+        del shmem
+        import gc
+        gc.collect()
 
 
 def test_all_reduce_ring_flags_too_small():
