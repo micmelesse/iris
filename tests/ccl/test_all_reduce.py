@@ -252,6 +252,7 @@ def test_all_reduce_one_shot_vllm_small(numel, dtype):
         shmem.barrier()
         del shmem
         import gc
+
         gc.collect()
 
 

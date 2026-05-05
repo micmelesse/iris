@@ -73,7 +73,14 @@ def all_reduce_preamble(
         config = Config()
 
     variant = config.all_reduce_variant.lower()
-    if variant not in [VARIANT_ATOMIC, VARIANT_RING, VARIANT_TWO_SHOT, VARIANT_ONE_SHOT, VARIANT_SPINLOCK, VARIANT_ONE_SHOT_VLLM]:
+    if variant not in [
+        VARIANT_ATOMIC,
+        VARIANT_RING,
+        VARIANT_TWO_SHOT,
+        VARIANT_ONE_SHOT,
+        VARIANT_SPINLOCK,
+        VARIANT_ONE_SHOT_VLLM,
+    ]:
         raise ValueError(
             f"Invalid all_reduce_variant: {variant}. Must be one of: {VARIANT_ATOMIC}, {VARIANT_RING}, {VARIANT_TWO_SHOT}, {VARIANT_ONE_SHOT}, {VARIANT_SPINLOCK}, {VARIANT_ONE_SHOT_VLLM}"
         )
@@ -777,8 +784,14 @@ def persistent_all_reduce_one_shot_vllm(
 
     # --- START BARRIER ---
     _per_block_barrier(
-        pid, start_flags_ptr, heap_bases,
-        group_rank, iris_rank, world_size, rank_start, rank_stride,
+        pid,
+        start_flags_ptr,
+        heap_bases,
+        group_rank,
+        iris_rank,
+        world_size,
+        rank_start,
+        rank_stride,
     )
 
     # --- REDUCE ---
@@ -807,8 +820,14 @@ def persistent_all_reduce_one_shot_vllm(
 
     # --- END BARRIER ---
     _per_block_barrier(
-        pid, end_flags_ptr, heap_bases,
-        group_rank, iris_rank, world_size, rank_start, rank_stride,
+        pid,
+        end_flags_ptr,
+        heap_bases,
+        group_rank,
+        iris_rank,
+        world_size,
+        rank_start,
+        rank_stride,
     )
 
 
@@ -1066,8 +1085,7 @@ def launch(
     elif variant == VARIANT_ONE_SHOT_VLLM:
         if workspace is None or workspace.start_flags is None or workspace.end_flags is None:
             raise RuntimeError(
-                "one_shot_vllm requires workspace with start_flags and end_flags. "
-                "Call all_reduce_preamble first."
+                "one_shot_vllm requires workspace with start_flags and end_flags. Call all_reduce_preamble first."
             )
         N_ELEMENTS = M * N
         BLOCK_SIZE = 2048
