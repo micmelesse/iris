@@ -21,9 +21,9 @@ from iris.host.distributed.helpers import _translate_ptr
 VARIANT_ATOMIC = "atomic"
 VARIANT_RING = "ring"
 VARIANT_TWO_SHOT = "two_shot"
-VARIANT_ONE_SHOT = "one_shot"
+VARIANT_ONE_SHOT_LEGACY = "one_shot_legacy"
 VARIANT_SPINLOCK = "spinlock"
-VARIANT_ONE_SHOT_VLLM = "one_shot_vllm"
+VARIANT_ONE_SHOT = "one_shot"
 
 
 @dataclass
@@ -77,12 +77,12 @@ def all_reduce_preamble(
         VARIANT_ATOMIC,
         VARIANT_RING,
         VARIANT_TWO_SHOT,
-        VARIANT_ONE_SHOT,
+        VARIANT_ONE_SHOT_LEGACY,
         VARIANT_SPINLOCK,
-        VARIANT_ONE_SHOT_VLLM,
+        VARIANT_ONE_SHOT,
     ]:
         raise ValueError(
-            f"Invalid all_reduce_variant: {variant}. Must be one of: {VARIANT_ATOMIC}, {VARIANT_RING}, {VARIANT_TWO_SHOT}, {VARIANT_ONE_SHOT}, {VARIANT_SPINLOCK}, {VARIANT_ONE_SHOT_VLLM}"
+            f"Invalid all_reduce_variant: {variant}. Must be one of: {VARIANT_ATOMIC}, {VARIANT_RING}, {VARIANT_TWO_SHOT}, {VARIANT_ONE_SHOT_LEGACY}, {VARIANT_SPINLOCK}, {VARIANT_ONE_SHOT}"
         )
 
     M, N = input_tensor.shape[:2]
@@ -97,7 +97,7 @@ def all_reduce_preamble(
     workspace.num_rings = getattr(config, "all_reduce_num_rings", 1)
     workspace.prepared = False
 
-    if variant in (VARIANT_ATOMIC, VARIANT_SPINLOCK, VARIANT_ONE_SHOT):
+    if variant in (VARIANT_ATOMIC, VARIANT_SPINLOCK, VARIANT_ONE_SHOT_LEGACY):
         output_tensor.zero_()
         ctx.barrier()
 
@@ -127,7 +127,7 @@ def all_reduce_preamble(
     elif variant == VARIANT_TWO_SHOT:
         pass
 
-    elif variant == VARIANT_ONE_SHOT_VLLM:
+    elif variant == VARIANT_ONE_SHOT:
         num_ranks = ctx.get_num_ranks()
         max_blocks = min(16, config.comm_sms)
         needed = max_blocks * num_ranks
@@ -364,7 +364,7 @@ def persistent_all_reduce_spinlock(
 
 
 @triton.jit()
-def persistent_all_reduce_one_shot(
+def persistent_all_reduce_one_shot_legacy(
     input_ptr,
     output_ptr,
     M,
@@ -763,7 +763,7 @@ def _per_block_barrier(
 
 
 @triton.jit()
-def persistent_all_reduce_one_shot_vllm(
+def persistent_all_reduce_one_shot(
     input_ptr,
     output_ptr,
     N_ELEMENTS,
@@ -871,7 +871,7 @@ def launch(
         or (variant == VARIANT_RING and workspace.num_rings != config.all_reduce_num_rings)
         or (variant == VARIANT_RING and workspace.flags_per_tile != 1)
         or (variant == VARIANT_SPINLOCK and (workspace.locks is None))
-        or (variant == VARIANT_ONE_SHOT_VLLM and (workspace.start_flags is None or workspace.end_flags is None))
+        or (variant == VARIANT_ONE_SHOT and (workspace.start_flags is None or workspace.end_flags is None))
     )
 
     if needs_prepare:
@@ -1053,9 +1053,9 @@ def launch(
             rank=rank_global,
             dtype=input_tensor.dtype,
         )
-    elif variant == VARIANT_ONE_SHOT:
+    elif variant == VARIANT_ONE_SHOT_LEGACY:
         iris_launch(
-            persistent_all_reduce_one_shot,
+            persistent_all_reduce_one_shot_legacy,
             (config.comm_sms,),
             input_tensor,
             output_tensor,
@@ -1082,10 +1082,10 @@ def launch(
             dtype=input_tensor.dtype,
         )
 
-    elif variant == VARIANT_ONE_SHOT_VLLM:
+    elif variant == VARIANT_ONE_SHOT:
         if workspace is None or workspace.start_flags is None or workspace.end_flags is None:
             raise RuntimeError(
-                "one_shot_vllm requires workspace with start_flags and end_flags. Call all_reduce_preamble first."
+                "one_shot requires workspace with start_flags and end_flags. Call all_reduce_preamble first."
             )
         N_ELEMENTS = M * N
         BLOCK_SIZE = 2048
@@ -1095,7 +1095,7 @@ def launch(
         flat_input = input_tensor.contiguous().view(-1)
         flat_output = output_tensor.contiguous().view(-1)
         iris_launch(
-            persistent_all_reduce_one_shot_vllm,
+            persistent_all_reduce_one_shot,
             (vllm_sms,),
             flat_input,
             flat_output,

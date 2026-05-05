@@ -18,8 +18,8 @@ from iris.ccl import Config
         "atomic",
         # "ring",
         "two_shot",
+        "one_shot_legacy",
         "one_shot",
-        "one_shot_vllm",
         # TODO enable these tests when support for cache-modifiers is in place.
         # "spinlock",
     ],
@@ -212,8 +212,8 @@ def test_all_reduce_spinlock_lock_too_small():
 
 @pytest.mark.parametrize("numel", [1024, 4096, 16384, 32768, 65536, 131072])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_all_reduce_one_shot_vllm_small(numel, dtype):
-    """Test one_shot_vllm at vLLM-relevant small message sizes."""
+def test_all_reduce_one_shot_small(numel, dtype):
+    """Test one_shot at vLLM-relevant small message sizes."""
     if not dist.is_initialized():
         pytest.skip("torch.distributed not initialized")
 
@@ -234,7 +234,7 @@ def test_all_reduce_one_shot_vllm_small(numel, dtype):
     iris_output = ctx.zeros((1, numel), dtype=dtype)
 
     ctx.barrier()
-    config = Config(all_reduce_variant="one_shot_vllm")
+    config = Config(all_reduce_variant="one_shot")
     workspace = ctx.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
     ctx.barrier()
     ctx.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
@@ -246,7 +246,7 @@ def test_all_reduce_one_shot_vllm_small(numel, dtype):
     try:
         assert torch.allclose(iris_output.view(-1), pytorch_output, atol=atol), (
             f"Max difference: {max_diff}, expected < {atol}\n"
-            f"Rank {rank}: one_shot_vllm output doesn't match PyTorch (numel={numel}, dtype={dtype})"
+            f"Rank {rank}: one_shot output doesn't match PyTorch (numel={numel}, dtype={dtype})"
         )
     finally:
         ctx.barrier()
@@ -257,8 +257,8 @@ def test_all_reduce_one_shot_vllm_small(numel, dtype):
 
 
 @pytest.mark.parametrize("numel", [4096, 32768, 131072])
-def test_all_reduce_one_shot_vllm_graph_capture(numel, dtype=torch.bfloat16):
-    """Test that one_shot_vllm is HIP graph capturable and produces correct results on replay."""
+def test_all_reduce_one_shot_graph_capture(numel, dtype=torch.bfloat16):
+    """Test that one_shot is HIP graph capturable and produces correct results on replay."""
     if not dist.is_initialized():
         pytest.skip("torch.distributed not initialized")
 
@@ -271,7 +271,7 @@ def test_all_reduce_one_shot_vllm_graph_capture(numel, dtype=torch.bfloat16):
     iris_input.view(-1).fill_(float(rank + 1))
     iris_output = ctx.zeros((1, numel), dtype=dtype)
 
-    config = Config(all_reduce_variant="one_shot_vllm")
+    config = Config(all_reduce_variant="one_shot")
     workspace = ctx.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
     ctx.barrier()
 
@@ -303,7 +303,7 @@ def test_all_reduce_one_shot_vllm_graph_capture(numel, dtype=torch.bfloat16):
     try:
         assert max_diff < atol, (
             f"Graph replay: max difference {max_diff}, expected < {atol}\n"
-            f"Rank {rank}: one_shot_vllm graph capture produced wrong results (numel={numel})"
+            f"Rank {rank}: one_shot graph capture produced wrong results (numel={numel})"
         )
 
         # Replay a second time to verify monotonic flags advance correctly
