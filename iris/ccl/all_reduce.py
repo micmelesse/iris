@@ -16,7 +16,7 @@ def all_reduce_preamble(output_tensor, input_tensor, ctx, config=None, workspace
     from iris.ccl.config import Config
 
     if config is None:
-        config = Config()
+        config = Config(all_reduce_variant="one_shot_gluon", use_gluon=True)
 
     variant = config.all_reduce_variant.lower()
     if variant == "one_shot_gluon" or config.use_gluon:
