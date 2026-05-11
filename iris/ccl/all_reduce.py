@@ -63,7 +63,7 @@ def all_reduce(output_tensor, input_tensor, ctx, op=None, group=None, async_op=F
         if _cached_config is not None:
             config = _cached_config
         else:
-            config = Config(block_size_m=32, block_size_n=64, all_reduce_distribution=1)
+            config = Config(all_reduce_variant="one_shot_gluon", use_gluon=True)
             _cached_config = config
 
     if config.use_gluon and config.all_reduce_variant not in ("one_shot_gluon",):
