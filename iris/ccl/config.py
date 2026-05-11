@@ -118,7 +118,15 @@ class Config:
             raise ValueError(
                 f"all_gather_variant must be one of: 'persistent', 'partitioned', got {self.all_gather_variant}"
             )
-        if self.all_reduce_variant not in ["atomic", "ring", "two_shot", "one_shot", "one_shot_legacy", "one_shot_gluon", "spinlock"]:
+        if self.all_reduce_variant not in [
+            "atomic",
+            "ring",
+            "two_shot",
+            "one_shot",
+            "one_shot_legacy",
+            "one_shot_gluon",
+            "spinlock",
+        ]:
             raise ValueError(
                 f"all_reduce_variant must be one of: 'atomic', 'ring', 'two_shot', 'one_shot', 'one_shot_legacy', 'one_shot_gluon', 'spinlock', got {self.all_reduce_variant}"
             )
