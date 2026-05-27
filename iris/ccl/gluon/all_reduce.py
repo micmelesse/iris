@@ -240,6 +240,13 @@ def launch(
         workspace.start_flags.zero_()
         workspace.end_flags.zero_()
 
+    # Experiment: force the end barrier even under graph capture (dual-barrier,
+    # like CustomAllreduce) instead of SINGLE_BARRIER=capturing. The capture-time
+    # end-barrier elision regressed decode TPOT; this restores the second barrier
+    # to measure whether decode recovers. Relative barrier protocol handles the
+    # non-zeroed end_flags across replays, same as the always-on start barrier.
+    single_barrier = False
+
     scratch_flat = flat_output
 
     iris_launch(
@@ -260,7 +267,7 @@ def launch(
         scratch_flat,
         block_size,
         num_sms,
-        capturing,
+        single_barrier,
         False,
         config.threads_per_warp,
         num_warps,
