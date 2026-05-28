@@ -126,7 +126,6 @@ class SymmetricHeap:
         actual_elements = max(num_elements, min_elements)
         tensor = self.allocator.allocate(actual_elements, dtype, alignment)
         tensor = tensor[:num_elements]
-        self.refresh_peer_access()
         return tensor
 
     def get_device(self) -> torch.device:
