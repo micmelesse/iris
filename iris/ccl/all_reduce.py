@@ -71,6 +71,11 @@ def all_reduce_preamble(
     if config is None:
         config = Config()
 
+    if config.use_gluon:
+        from .gluon_all_reduce import all_reduce_preamble as _gluon_preamble
+
+        return _gluon_preamble(output_tensor, input_tensor, shmem, config=config, workspace=workspace)
+
     variant = config.all_reduce_variant.lower()
     if variant not in [VARIANT_ATOMIC, VARIANT_RING, VARIANT_TWO_SHOT, VARIANT_ONE_SHOT, VARIANT_SPINLOCK]:
         raise ValueError(
@@ -786,18 +791,27 @@ def all_reduce(
     if config is None:
         config = Config(block_size_m=32, block_size_n=64, all_reduce_distribution=1)
 
-    # Check for unsupported options
-    if config.use_gluon:
-        raise ValueError(
-            "all_reduce does not support use_gluon=True. "
-            "Gluon implementation is not available for all_reduce. "
-            "Use default config (use_gluon=False)."
-        )
-
     # Extract group information
     # rank_in_group: position within the ProcessGroup (0, 1, 2, ...) - passed as group_rank to kernel
     # rank_global: global rank in iris context - passed as iris_rank to kernel for RMA operations
     rank_in_group, rank_global, world_size, rank_start, rank_stride = extract_group_info(group, shmem)
+
+    if config.use_gluon:
+        from .gluon_all_reduce import launch as _gluon_launch
+
+        return _gluon_launch(
+            output_tensor,
+            input_tensor,
+            shmem,
+            rank_in_group,
+            rank_global,
+            world_size,
+            rank_start,
+            rank_stride,
+            config,
+            workspace=workspace,
+            group=group,
+        )
     M, N = input_tensor.shape[:2]
 
     stride_in_m, stride_in_n = input_tensor.stride(0), input_tensor.stride(1)
