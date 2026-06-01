@@ -257,7 +257,7 @@ def launch(
         scratch_flat,
         block_size,
         num_sms,
-        capturing,
+        False,  # SINGLE_BARRIER: match two_shot — end barrier always on
         False,
         config.threads_per_warp,
         num_warps,
