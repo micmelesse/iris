@@ -1159,7 +1159,7 @@ class Iris:
 
             _all_to_all(output_tensor, input_tensor, self._iris, group=group, async_op=async_op, config=config)
 
-        def all_gather(self, output_tensor, input_tensor, group=None, async_op=False, config=None):
+        def all_gather(self, output_tensor, input_tensor, group=None, async_op=False, config=None, workspace=None):
             """
             All-gather collective operation.
 
@@ -1192,7 +1192,15 @@ class Iris:
             """
             from iris.ccl.all_gather import all_gather as _all_gather
 
-            _all_gather(output_tensor, input_tensor, self._iris, group=group, async_op=async_op, config=config)
+            return _all_gather(
+                output_tensor,
+                input_tensor,
+                self._iris,
+                group=group,
+                async_op=async_op,
+                config=config,
+                workspace=workspace,
+            )
 
         def all_reduce_preamble(self, output_tensor, input_tensor, config=None, workspace=None):
             """
