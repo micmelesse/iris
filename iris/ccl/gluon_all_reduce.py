@@ -257,7 +257,13 @@ def launch(
         scratch_flat,
         block_size,
         num_sms,
-        False,  # SINGLE_BARRIER: match two_shot — end barrier always on
+        # SINGLE_BARRIER elides the end barrier. Safe iff something else
+        # guarantees this op's writes are visible before its output is read.
+        # Under graph capture that holds — the next replay's start barrier
+        # covers the prior replay's writes — so single is correct and drops the
+        # end-barrier sync the consumer (e.g. rmsnorm) otherwise waits on (the
+        # +12.8s in-graph idle at TP=8). Eager has no next replay, so keep both.
+        capturing,  # SINGLE_BARRIER
         False,
         config.threads_per_warp,
         num_warps,
