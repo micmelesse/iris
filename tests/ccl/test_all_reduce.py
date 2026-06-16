@@ -256,65 +256,110 @@ def test_all_reduce_one_shot_small(numel, dtype):
         gc.collect()
 
 
+def _all_reduce_step(impl, src, stage_buf, result, ctx=None, config=None, workspace=None):
+    """One replay unit: stage src into the input buffer, then all-reduce.
+
+    Module-level (not a closure) so the test can `del ctx` for IPC cleanup
+    without an enclosing closure keeping the instance alive. async_op=True
+    matches how the vLLM/aiter communicator dispatches (no trailing barrier).
+    """
+    if impl == "torch":
+        result.copy_(src)
+        dist.all_reduce(result, op=dist.ReduceOp.SUM)
+    else:
+        stage_buf.copy_(src)
+        ctx.ccl.all_reduce(result, stage_buf, config=config, workspace=workspace, async_op=True)
+
+
+@pytest.mark.parametrize("impl", ["torch", "one_shot", "one_shot_gluon"])
+@pytest.mark.parametrize("vary", [False, True])
 @pytest.mark.parametrize("numel", [4096, 32768, 131072])
-def test_all_reduce_one_shot_graph_capture(numel, dtype=torch.bfloat16):
-    """Test that one_shot is HIP graph capturable and produces correct results on replay."""
+def test_all_reduce_graph_capture(impl, vary, numel, dtype=torch.bfloat16):
+    """HIP-graph capture/replay of all-reduce, across impls and input regimes.
+
+    Generalizes the original one_shot, identical-input capture test with two
+    axes that surface a cross-rank race the original could not see:
+
+      impl  "torch" is the known-good control (torch.distributed through the
+            identical harness; it must pass every cell). "one_shot" (Triton) and
+            "one_shot_gluon" (the variant the vLLM/aiter communicator dispatches
+            to) are under test.
+      vary  False replays the SAME input, so a stale peer read returns
+            identical-correct data and passes (the original coverage). True
+            copies a fresh input into the static buffer before each replay and
+            checks each against its own reference -- how the communicator drives
+            the collective per token -- so a dropped/stale peer slot surfaces.
+
+    Inputs are small integers (rank r contributes 1 + r + replay%16) so the
+    reduced sum is exact in bf16/fp16 and any >=1 mismatch is a real drop, not
+    fp rounding.
+    """
     if not dist.is_initialized():
         pytest.skip("torch.distributed not initialized")
 
+    num_replays = 200
     heap_size = 2**33
     ctx = iris.iris(heap_size)
     rank = ctx.get_rank()
-    world_size = dist.get_world_size()
+    world_size = ctx.get_num_ranks()
 
-    iris_input = ctx.zeros((1, numel), dtype=dtype)
-    iris_input.view(-1).fill_(float(rank + 1))
-    iris_output = ctx.zeros((1, numel), dtype=dtype)
+    # src holds each replay's activation, off the symmetric heap (like the input
+    # vLLM hands the communicator before each captured step).
+    src = torch.empty((1, numel), dtype=dtype, device=f"cuda:{rank}")
 
-    config = Config(all_reduce_variant="one_shot")
-    workspace = ctx.ccl.all_reduce_preamble(iris_output, iris_input, config=config)
+    if impl == "torch":
+        stage_buf = None
+        result = torch.empty((1, numel), dtype=dtype, device=f"cuda:{rank}")
+        config = workspace = None
+    else:
+        stage_buf = ctx.zeros((1, numel), dtype=dtype)
+        result = ctx.zeros((1, numel), dtype=dtype)
+        config = Config(all_reduce_variant=impl, use_gluon=(impl == "one_shot_gluon"))
+        workspace = ctx.ccl.all_reduce_preamble(result, stage_buf, config=config)
     ctx.barrier()
 
-    # Warmup run outside graph to JIT-compile the kernel
-    ctx.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
+    def fill_src(replay):
+        src.fill_(float(1 + rank + (replay % 16)))
+
+    def expected(replay):
+        # sum_r (1 + r + replay%16) = world*(1 + replay%16) + world*(world-1)/2
+        return float(world_size * (1 + (replay % 16)) + world_size * (world_size - 1) // 2)
+
+    # Warmup (JIT / lazy setup) then capture copy+all_reduce as one unit.
+    fill_src(0)
+    _all_reduce_step(impl, src, stage_buf, result, ctx=ctx, config=config, workspace=workspace)
     torch.cuda.synchronize()
-
-    # Capture into a HIP graph
     ctx.barrier()
-    iris_output.zero_()
+
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
         graph.capture_begin()
-        ctx.ccl.all_reduce(iris_output, iris_input, config=config, workspace=workspace)
+        _all_reduce_step(impl, src, stage_buf, result, ctx=ctx, config=config, workspace=workspace)
         graph.capture_end()
     torch.cuda.current_stream().wait_stream(stream)
 
-    # Replay the graph
-    iris_output.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-
-    expected_sum = world_size * (world_size + 1) / 2.0
-    atol = 1e-3
-    max_diff = torch.abs(iris_output.view(-1) - expected_sum).max().item()
-
+    atol = 0.5  # inputs are exact integers; >=1 mismatch is a real drop
+    failures = []
     try:
-        assert max_diff < atol, (
-            f"Graph replay: max difference {max_diff}, expected < {atol}\n"
-            f"Rank {rank}: one_shot graph capture produced wrong results (numel={numel})"
+        for i in range(num_replays):
+            replay = i if vary else 0
+            fill_src(replay)
+            graph.replay()
+            torch.cuda.synchronize()
+            max_diff = torch.abs(result.view(-1) - expected(replay)).max().item()
+            if not max_diff <= atol:
+                failures.append((i, round(max_diff, 4)))
+        print(
+            f"[rank {rank}] all_reduce graph impl={impl} vary={vary} numel={numel}: "
+            f"{num_replays - len(failures)}/{num_replays} ok" + (f"  FAIL first={failures[:8]}" if failures else ""),
+            flush=True,
         )
-
-        # Replay a second time to verify monotonic flags advance correctly
-        iris_output.zero_()
-        graph.replay()
-        torch.cuda.synchronize()
-
-        max_diff2 = torch.abs(iris_output.view(-1) - expected_sum).max().item()
-        assert max_diff2 < atol, (
-            f"Second graph replay: max difference {max_diff2}, expected < {atol}\n"
-            f"Rank {rank}: monotonic barrier flags broke on second replay (numel={numel})"
+        assert not failures, (
+            f"impl={impl} vary={vary} numel={numel}: {len(failures)}/{num_replays} replays wrong "
+            f"(first replay {failures[0][0]}, max|diff|={failures[0][1]}). "
+            f"torch and vary=False must pass; one_shot_gluon+vary=True failing localizes the bug to the gluon kernel."
         )
     finally:
         del graph

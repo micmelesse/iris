@@ -103,3 +103,122 @@ def test_all_gather_gluon(dtype, M, N, block_size_m, block_size_n):
         import gc
 
         gc.collect()
+
+
+def _all_gather_step(impl, src, stage_buf, result, shmem=None, config=None):
+    """One replay unit: stage src into the input buffer, then all-gather.
+
+    Module-level (not a closure) so the test can `del shmem` for IPC cleanup
+    without an enclosing closure keeping the instance alive.
+    """
+    stage_buf.copy_(src)
+    if impl == "gluon":
+        # async_op=True matches the communicator; async_op=False runs a trailing
+        # barrier that host-syncs, which is illegal inside graph capture.
+        shmem.ccl.all_gather(result, stage_buf, config=config, async_op=True)
+    else:
+        dist.all_gather_into_tensor(result, stage_buf)
+
+
+@pytest.mark.skipif(not GLUON_AVAILABLE, reason="Gluon not available")
+@pytest.mark.parametrize("impl", ["torch", "gluon"])
+@pytest.mark.parametrize("vary", [False, True])
+@pytest.mark.parametrize(
+    "M, N, block_size_m, block_size_n",
+    [
+        (64, 8192, 32, 1024),
+        (256, 8192, 32, 1024),
+    ],
+)
+def test_all_gather_gluon_graph_capture(impl, vary, M, N, block_size_m, block_size_n, dtype=torch.bfloat16):
+    """HIP-graph capture/replay of the gluon all-gather, across input regimes.
+
+    all-gather had NO graph-capture coverage (the existing test is eager); this
+    adds it with the same axes as the all-reduce twin in test_all_reduce.py
+    (test_all_reduce_graph_capture):
+
+      impl  "torch" is the known-good control (must pass every cell); "gluon" is
+            the path the vLLM/aiter communicator dispatches to.
+      vary  False replays the SAME input (a stale block read returns identical-
+            correct data and passes); True copies a fresh input each replay and
+            checks each gathered block against its own value, so a dropped/stale
+            peer slot surfaces -- how the communicator drives it per token.
+
+    Inputs are small integers (rank r's block = 1 + r + replay%16), exact in
+    bf16/fp16, so any >=1 mismatch is a real drop.
+    """
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    num_replays = 200
+    max_ranks = int(os.environ.get("WORLD_SIZE", 8))
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    needed = (1 + max_ranks) * M * N * elem_size
+    heap_size = max(2**30, int(needed * 2))
+    shmem = iris.iris(heap_size)
+    rank = shmem.get_rank()
+    world_size = shmem.get_num_ranks()
+
+    # src holds each replay's activation, off the symmetric heap.
+    src = torch.empty((M, N), dtype=dtype, device=f"cuda:{rank}")
+
+    if impl == "gluon":
+        stage_buf = shmem.zeros((M, N), dtype=dtype)
+        result = shmem.zeros((world_size * M, N), dtype=dtype)
+        config = Config(use_gluon=True, block_size_m=block_size_m, block_size_n=block_size_n)
+    else:
+        stage_buf = torch.empty((M, N), dtype=dtype, device=f"cuda:{rank}")
+        result = torch.empty((world_size * M, N), dtype=dtype, device=f"cuda:{rank}")
+        config = None
+    shmem.barrier()
+
+    def fill_src(replay):
+        src.fill_(float(1 + rank + (replay % 16)))
+
+    # Warmup (runs any lazy setup) then capture copy+all_gather as one unit.
+    fill_src(0)
+    _all_gather_step(impl, src, stage_buf, result, shmem=shmem, config=config)
+    torch.cuda.synchronize()
+    shmem.barrier()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        graph.capture_begin()
+        _all_gather_step(impl, src, stage_buf, result, shmem=shmem, config=config)
+        graph.capture_end()
+    torch.cuda.current_stream().wait_stream(stream)
+
+    atol = 0.5  # inputs are exact integers; >=1 mismatch is a real drop
+    failures = []
+    try:
+        for i in range(num_replays):
+            replay = i if vary else 0
+            fill_src(replay)
+            graph.replay()
+            torch.cuda.synchronize()
+            diffs = [
+                torch.abs(result[r * M : (r + 1) * M] - float(1 + r + (replay % 16))).max().item()
+                for r in range(world_size)
+            ]
+            bad = [r for r in range(world_size) if diffs[r] > atol]
+            if bad:
+                failures.append((i, round(max(diffs[r] for r in bad), 4), bad))
+        print(
+            f"[rank {rank}] all_gather graph impl={impl} vary={vary} {M}x{N}: "
+            f"{num_replays - len(failures)}/{num_replays} ok" + (f"  FAIL first={failures[0]}" if failures else ""),
+            flush=True,
+        )
+        assert not failures, (
+            f"impl={impl} vary={vary} {M}x{N}: {len(failures)}/{num_replays} replays wrong "
+            f"(first replay {failures[0][0]}, max|diff|={failures[0][1]}, bad blocks={failures[0][2]}). "
+            f"torch and vary=False must pass; gluon+vary=True failing localizes the bug to the gluon kernel."
+        )
+    finally:
+        del graph
+        shmem.barrier()
+        del shmem
+        import gc
+
+        gc.collect()
